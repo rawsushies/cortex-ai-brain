@@ -194,25 +194,32 @@ class MoveTest(Tmp):
             cloud.move_vault(v, v / "inside")
 
     def test_detection(self):
+        # Use this OS's real Google Drive location (faking another OS breaks pathlib on Windows).
         home = self.t / "home"
-        (home / "GoogleDrive").mkdir(parents=True)
+        gd = home / ("My Drive" if os.name == "nt" else "GoogleDrive")
+        if sys.platform == "darwin":
+            gd = home / "Library" / "CloudStorage" / "GoogleDrive-me@example.com" / "My Drive"
+        gd.mkdir(parents=True)
         (home / "Dropbox").mkdir()
-        with mock.patch.object(cloud, "HOME", home), mock.patch.object(cloud.os, "name", "posix"), \
-                mock.patch.object(cloud.sys, "platform", "linux"):
+        with mock.patch.object(cloud, "HOME", home):
             found = cloud.cloud_folders()
-            self.assertEqual([f["provider"] for f in found], ["Google Drive", "Dropbox"])
-            self.assertEqual(cloud.provider_for(home / "GoogleDrive" / "Cortex")["provider"], "Google Drive")
+            self.assertEqual(found[0]["provider"], "Google Drive")
+            self.assertIn("Dropbox", [f["provider"] for f in found])
+            self.assertEqual(cloud.provider_for(gd / "Cortex")["provider"], "Google Drive")
             self.assertIsNone(cloud.provider_for(home / "Documents" / "Cortex"))
         self.assertEqual(cloud.provider_for(Path("G:/My Drive/Cortex"))["provider"], "Google Drive")
 
     def test_cli_cloud_end_to_end(self):
         home = self.t / "home"
-        (home / "GoogleDrive").mkdir(parents=True)
+        drive = home / ("My Drive" if os.name == "nt" else "GoogleDrive")
+        if sys.platform == "darwin":
+            drive = home / "Library" / "CloudStorage" / "GoogleDrive-me@example.com" / "My Drive"
+        drive.mkdir(parents=True)
         v = home / "Documents" / "Cortex"
         from cortex import cli
         with mock.patch.object(cli, "CONFIG", home / ".config/cortex/config.json"), mock.patch.object(cli, "HOME", home), \
-                mock.patch.object(cloud, "HOME", home), mock.patch.object(cloud.os, "name", "posix"), \
-                mock.patch.object(cloud.sys, "platform", "linux"), mock.patch.object(cli.shutil, "which", return_value=None), \
+                mock.patch.object(cloud, "HOME", home), mock.patch.object(cli.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"APPDATA": str(home / "AppData"), "OneDrive": ""}), \
                 mock.patch("builtins.print"):
             cli.main(["init", str(v)])
             b = Brain(v)
@@ -220,9 +227,9 @@ class MoveTest(Tmp):
             b.close()
             cli.main(["cloud", "--yes"])
             cfg = json.loads((home / ".config/cortex/config.json").read_text())
-        self.assertEqual(cfg["vault"], str((home / "GoogleDrive" / "Cortex").resolve()))
-        self.assertTrue((home / "GoogleDrive/Cortex/Projects/X.md").exists())
-        self.assertTrue(list((home / "GoogleDrive" / "Cortex Backups").glob("Cortex-backup-*.zip")))
+        self.assertEqual(cfg["vault"], str((drive / "Cortex").resolve()))
+        self.assertTrue((drive / "Cortex" / "Projects" / "X.md").exists())
+        self.assertTrue(list((drive / "Cortex Backups").glob("Cortex-backup-*.zip")))
         self.assertTrue((v / "Projects/X.md").exists())  # old copy kept as a fallback
 
 
