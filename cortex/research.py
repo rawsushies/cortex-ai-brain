@@ -392,26 +392,6 @@ def search_lemmy(query: str, n: int = 8) -> list[Result]:
     return out
 
 
-def search_x(query: str, n: int = 6) -> list[Result]:
-    """No free X search exists; find x.com posts via web search, then read each one."""
-    hits = search_web(f"{query} site:x.com", n * 2) + search_web(f"{query} site:twitter.com", n)
-    out, seen = [], set()
-    for h in hits:
-        m = X_STATUS.search(h.url)
-        if not m or m.group(2) in seen:
-            continue
-        seen.add(m.group(2))
-        try:
-            post = read_x(h.url)
-            out.append(Result("x", post["title"][:90], post["url"], post["text"], post.get("date", ""),
-                              post.get("author", ""), post.get("likes"), {k: post.get(k) for k in ("reposts", "replies", "views")}))
-        except FetchError:
-            out.append(Result("x", h.title, h.url, h.snippet))
-        if len(out) >= n:
-            break
-    return out
-
-
 def _yt_page_search(query: str, n: int = 6) -> list[Result]:
     page, _ = http_get("https://www.youtube.com/results?search_query=" + q(query))
     m = re.search(r"var ytInitialData = (\{.*?\});</script>", page, re.S)
@@ -568,7 +548,7 @@ def _reddit_thread_json(url: str, host: str = "www.reddit.com") -> dict:
     lines = [post.get("selftext", "")]
     if post.get("url") and not post.get("is_self"):
         lines.append(f"Link: {post['url']}")
-    lines.append(f"\n## Top comments")
+    lines.append("\n## Top comments")
     for c in d[1]["data"]["children"][:25]:
         cd = c.get("data", {})
         if cd.get("body"):

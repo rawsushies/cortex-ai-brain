@@ -91,3 +91,73 @@ class ExeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RobustnessTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.b = Brain(Path(self.tmp.name) / "v")
+
+    def tearDown(self):
+        self.b.close()
+        self.tmp.cleanup()
+
+    def test_retries_when_windows_briefly_locks_a_file(self):
+        real = os.replace
+        calls = []
+
+        def flaky(a, b):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError(32, "being used by another process")
+            return real(a, b)
+        with mock.patch("cortex.core.os.replace", side_effect=flaky), mock.patch("cortex.core.time.sleep"):
+            self.b.write("A.md", "# A\nsaved")
+        self.assertEqual((Path(self.tmp.name) / "v" / "A.md").read_text(), "# A\nsaved\n")
+        self.assertFalse(list((Path(self.tmp.name) / "v").glob(".*.tmp")))
+
+    def test_permanent_lock_is_reported_clearly(self):
+        with mock.patch("cortex.core.os.replace", side_effect=PermissionError(32, "in use")), mock.patch("cortex.core.time.sleep"):
+            with self.assertRaises(PermissionError) as e:
+                self.b.write("A.md", "x")
+        self.assertIn("locked by another program", str(e.exception))
+        self.assertFalse(list((Path(self.tmp.name) / "v").glob(".*.tmp")))  # no temp litter
+
+    def test_concurrent_saves_of_one_note_never_corrupt_it(self):
+        bodies = [f"# Note\n{'v%d ' % i * 2000}" for i in range(12)]
+        errs = []
+
+        def save(t):
+            try:
+                self.b.write("Shared.md", t, agent="you")
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+        threads = [threading.Thread(target=save, args=(t,)) for t in bodies]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(errs, [])
+        final = (Path(self.tmp.name) / "v" / "Shared.md").read_text()
+        self.assertIn(final.rstrip("\n"), [t for t in bodies])  # exactly one complete version, never a mix
+
+
+class PortTest(unittest.TestCase):
+    def test_second_launch_and_busy_port(self):
+        import socket
+        from cortex import web
+        with tempfile.TemporaryDirectory() as t:
+            b = Brain(Path(t) / "v")
+            first, port = web._bind(b, 47000 + os.getpid() % 1000)
+            threading.Thread(target=first.serve_forever, daemon=True).start()
+            again, port2 = web._bind(b, port)
+            self.assertIsNone(again)  # Cortex already there: reuse it
+            self.assertEqual(port2, port)
+            blocker = socket.socket()
+            blocker.bind(("127.0.0.1", port + 5))
+            blocker.listen()
+            other, port3 = web._bind(b, port + 5)  # someone else's program: move on
+            self.assertEqual(port3, port + 6)
+            other.server_close()
+            blocker.close()
+            first.shutdown()
+            first.server_close()
+            b.close()

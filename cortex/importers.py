@@ -401,9 +401,16 @@ AI_NAMES = {"Claude Code": "Claude", "Claude.ai": "Claude", "Codex": "Codex", "G
             "Cursor": "Cursor", "ChatGPT": "ChatGPT"}
 
 
-def _safe(s: str, n: int = 60) -> str:
+def _safe(s: str, n: int = 60, max_bytes: int = 90) -> str:
+    """A title usable as a file name on every system: no reserved characters, and short in
+    BYTES too (Japanese/Arabic/emoji take 3-4 bytes per character)."""
     s = re.sub(r'[\\/:*?"<>|#^\[\]\x00-\x1f]+', " ", s)
-    s = " ".join(s.split())[:n].rstrip(" .")
+    s = " ".join(s.split())[:n]
+    while len(s.encode("utf-8")) > max_bytes:
+        s = s[:-1]
+    s = s.rstrip(" .")
+    if s.split(".")[0].strip().upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        s = "_" + s
     return s or "Untitled"
 
 
@@ -517,7 +524,11 @@ class Importer:
                 if prev and prev.get("sig") == c.sig and (self.brain.root / prev["path"]).exists():
                     continue
                 rel = prev["path"] if prev else note_path(c)
-                self.brain.store(rel, render(c))
+                try:
+                    self.brain.store(rel, render(c))
+                except (ValueError, OSError) as e:  # one odd conversation must not stop the import
+                    print(f"cortex import: skipped {c.source} {c.key}: {e}", file=sys.stderr)
+                    continue
                 notes[c.key] = {"sig": c.sig, "path": rel}
                 counts[c.source] = counts.get(c.source, 0) + 1
                 if prev:

@@ -470,7 +470,7 @@ class Server:
                 result = {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}, "prompts": {}},
-                    "serverInfo": {"name": "cortex", "version": "1.5.0"},
+                    "serverInfo": {"name": "cortex", "version": "1.5.1"},
                     "instructions": "Cortex is the user's shared second brain. Call brain_context at the start, search before writing, prefer brain_edit over overwriting, and brain_log when you finish meaningful work.",
                 }
             elif method == "ping":
@@ -483,9 +483,10 @@ class Server:
                 if not fn:
                     return _err(mid, -32602, f"unknown tool {name}")
                 try:
-                    text = fn(params.get("arguments") or {})
+                    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
+                    text = fn(_validate(schema, params.get("arguments")))
                     result = {"content": [{"type": "text", "text": text}]}
-                except (KeyError, ValueError, FileNotFoundError, FileExistsError, ConflictError, FetchError, PermissionError) as e:
+                except (KeyError, ValueError, FileNotFoundError, FileExistsError, ConflictError, FetchError, PermissionError, OSError) as e:
                     msg_ = f"missing argument {e}" if isinstance(e, KeyError) else str(e)
                     result = {"content": [{"type": "text", "text": f"Error: {msg_}"}], "isError": True}
             elif method == "prompts/list":
@@ -530,6 +531,51 @@ class Server:
                 _write(stdout, replies if isinstance(msg, list) else replies[0])
 
 
+def _validate(schema: dict, args) -> dict:
+    """Check and gently coerce tool arguments against the tool's schema. AIs sometimes send
+    "800" for 800 or a number where text belongs; give them a clear message instead of a crash."""
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        raise ValueError("arguments must be an object")
+    props = schema.get("properties", {})
+    out = {}
+    for key, val in args.items():
+        spec = props.get(key)
+        if spec is None or val is None:
+            continue  # unknown or empty optional argument: ignore
+        typ = spec.get("type")
+        if typ == "string":
+            if isinstance(val, bool) or not isinstance(val, (str, int, float)):
+                raise ValueError(f"'{key}' must be text")
+            val = str(val)
+            if "enum" in spec and val not in spec["enum"]:
+                raise ValueError(f"'{key}' must be one of: {', '.join(spec['enum'])}")
+        elif typ == "integer":
+            if isinstance(val, bool):
+                raise ValueError(f"'{key}' must be a whole number")
+            try:
+                val = int(float(val))
+            except (TypeError, ValueError):
+                raise ValueError(f"'{key}' must be a whole number")
+            val = max(-10**6, min(val, 10**6))
+        elif typ == "boolean":
+            if isinstance(val, str):
+                if val.lower() not in ("true", "false", "1", "0", "yes", "no"):
+                    raise ValueError(f"'{key}' must be true or false")
+                val = val.lower() in ("true", "1", "yes")
+            elif not isinstance(val, (bool, int)):
+                raise ValueError(f"'{key}' must be true or false")
+            val = bool(val)
+        elif typ == "array" and not isinstance(val, list):
+            raise ValueError(f"'{key}' must be a list")
+        out[key] = val
+    for key in schema.get("required", []):
+        if out.get(key) in (None, ""):
+            raise ValueError(f"missing argument '{key}'")
+    return out
+
+
 def _fmt_task(t: dict) -> str:
     box = "x" if t["done"] else " "
     due = f" (due {t['due']}{', OVERDUE' if t['overdue'] else ''})" if t["due"] else ""
@@ -568,7 +614,10 @@ def run(vault: str, agent: str | None = None) -> None:
         import threading
         from .importers import Importer
         threading.Thread(target=lambda: _quiet(Importer(brain).run), name="cortex-import", daemon=True).start()
-    Server(brain, agent or os.environ.get("CORTEX_AGENT")).serve()
+    try:
+        Server(brain, agent or os.environ.get("CORTEX_AGENT")).serve()
+    finally:  # the AI app closed the connection: close the index cleanly
+        brain.close()
 
 
 def _quiet(fn) -> None:

@@ -173,7 +173,8 @@ def cmd_init(args) -> None:
     if made:
         print("Added: " + ", ".join(made))
     print(f"Indexed {stats['notes']} notes.\n")
-    print("Next:\n  python run.py connect   (plug your AIs in)\n  python run.py app       (open the app)")
+    if not FROZEN:
+        print("Next:\n  python run.py connect   (plug your AIs in)\n  python run.py app       (open the app)")
 
 
 # ── connect ─────────────────────────────────────────────────────────────

@@ -28,7 +28,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = 5  # bump when the index layout changes; the index then rebuilds itself
@@ -48,6 +48,8 @@ TASK = re.compile(r"^(\s*[-*+]\s+\[)([ xX])(\]\s+)(.*)$")
 DUE = re.compile(r"(?:📅\s*|due:\s*|@)(\d{4}-\d{2}-\d{2})")
 SYNC_INTERVAL = 2.0  # seconds between disk re-checks; grows with vault size (see sync)
 SNIPPET_CHARS = 170
+MAX_NAME_BYTES = 150  # per file/folder name (file systems allow 255; leave room)
+MAX_REL_PATH = 200  # vault-relative; keeps full paths under Windows' 260-character limit
 HEADING_WEIGHT = 6  # recall: a query word in a passage heading counts like this many mentions
 HISTORY_KEEP = 30  # versions kept per note
 ACTIVE_STATUSES = {"active", "in progress", "in-progress", "doing", "ongoing", "open"}
@@ -262,7 +264,11 @@ class Brain:
             raise ValueError("empty path")
         if not rel.lower().endswith(".md"):
             rel += ".md"
+        if len(rel) > MAX_REL_PATH:
+            raise ValueError(f"path too long (max {MAX_REL_PATH} characters; Windows can't handle longer paths)")
         for part in rel.split("/"):
+            if len(part.encode("utf-8")) > MAX_NAME_BYTES:
+                raise ValueError(f"name too long: {part[:40]}… (max {MAX_NAME_BYTES} bytes per folder or file name)")
             if part.lower() in SKIP_DIRS:  # case-insensitive: ".CORTEX" is ".cortex" on Windows/macOS
                 raise ValueError("path is inside a reserved folder")
             stem = part.split(".")[0].strip().upper()
@@ -833,10 +839,25 @@ class Brain:
 
     # ── writing ──────────────────────────────────────────────────────────
     def _atomic_write(self, p: Path, content: str) -> None:
+        """Write via a temp file + rename, so Obsidian/sync never see half a note.
+        The temp name is unique per process and thread: the app and an AI saving the same note
+        at the same moment must not share (and clobber) one temp file."""
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp = p.with_name(f".{p.name}.{os.getpid()}-{threading.get_ident()}.tmp")
         tmp.write_text(content if content.endswith("\n") else content + "\n", encoding="utf-8")
-        os.replace(tmp, p)  # atomic: Obsidian never sees a half-written file
+        for attempt in range(7):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                # Windows: antivirus, the search indexer or a sync app briefly holds the file open.
+                if attempt == 6:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    raise PermissionError(f"{p.name} is locked by another program (antivirus, sync or an editor); try again")
+                time.sleep(0.05 * 2 ** attempt)
 
     def store(self, path: str, content: str) -> str:
         """Machine write for imports: atomic + indexed, but no version snapshot,

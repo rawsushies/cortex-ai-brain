@@ -8,6 +8,7 @@ server never approves, so other websites cannot write to your brain.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -74,7 +75,13 @@ def make_handler(brain: Brain):
             n = int(self.headers.get("Content-Length") or 0)
             if n > MAX_BODY:
                 raise ValueError(f"request too large (limit {MAX_BODY // 1_000_000} MB)")
-            return json.loads(self.rfile.read(n) or b"{}") if n else {}
+            try:
+                data = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except ValueError:
+                raise ValueError("request body must be JSON")
+            if not isinstance(data, dict):
+                raise ValueError("request body must be a JSON object")
+            return data
 
         def _guard(self) -> bool:
             if self.headers.get("X-Cortex") != "1":
@@ -95,6 +102,10 @@ def make_handler(brain: Brain):
                 self._json({"error": str(e)}, 403)
             except (ValueError, KeyError, FileExistsError) as e:
                 self._json({"error": str(e)}, 400)
+            except (TypeError, AttributeError) as e:  # a field of the wrong type (e.g. a number where text belongs)
+                self._json({"error": f"invalid request: {e}"}, 400)
+            except OSError as e:  # disk full, file locked by another program, etc.
+                self._json({"error": f"couldn't complete that: {e.strerror or e}"}, 500)
             except Exception as e:  # pragma: no cover
                 self._json({"error": f"server error: {e}"}, 500)
 
@@ -107,16 +118,16 @@ def make_handler(brain: Brain):
             api = {
                 "/api/stats": lambda: brain.stats(),
                 "/api/tree": lambda: brain.tree(),
-                "/api/recent": lambda: brain.recent(int(q.get("limit", 20))),
+                "/api/recent": lambda: brain.recent(_int(q.get("limit"), 20)),
                 "/api/tags": lambda: brain.tags(),
                 "/api/graph": lambda: brain.graph(),
-                "/api/activity": lambda: brain.activity(int(q.get("limit", 60)), q.get("agent") or None),
-                "/api/search": lambda: [h.__dict__ for h in brain.search(q.get("q", ""), int(q.get("limit", 30)), q.get("tag") or None)],
+                "/api/activity": lambda: brain.activity(_int(q.get("limit"), 60), q.get("agent") or None),
+                "/api/search": lambda: [h.__dict__ for h in brain.search(q.get("q", ""), _int(q.get("limit"), 30), q.get("tag") or None)],
                 "/api/note": lambda: brain.read(q["path"]),
-                "/api/related": lambda: [h.__dict__ for h in brain.related(q["path"], int(q.get("limit", 6)))],
-                "/api/tasks": lambda: brain.tasks(q.get("status", "open"), q.get("path") or None, q.get("q") or None, int(q.get("limit", 500))),
+                "/api/related": lambda: [h.__dict__ for h in brain.related(q["path"], _int(q.get("limit"), 6))],
+                "/api/tasks": lambda: brain.tasks(q.get("status", "open"), q.get("path") or None, q.get("q") or None, _int(q.get("limit"), 500)),
                 "/api/health": lambda: brain.health(),
-                "/api/recap": lambda: brain.recap(int(q.get("days", 7))),
+                "/api/recap": lambda: brain.recap(_int(q.get("days"), 7)),
                 "/api/history": lambda: brain.history(q["path"]),
                 "/api/version": lambda: {"content": brain.version(q["path"], q["id"])},
                 "/api/import/status": lambda: Importer(brain).status(),
@@ -124,8 +135,8 @@ def make_handler(brain: Brain):
                 "/api/setup": lambda: {"import_history": _cfg().get("import_history"),
                                        "connected": bool(_cfg().get("connected_at")),
                                        "detected": Importer(brain).status()["detected"]},
-                "/api/conversations": lambda: brain.recent(int(q.get("limit", 200)), conversations="only") if not q.get("q")
-                    else [h.__dict__ for h in brain.search(q["q"], int(q.get("limit", 50)), scope="conversations")],
+                "/api/conversations": lambda: brain.recent(_int(q.get("limit"), 200), conversations="only") if not q.get("q")
+                    else [h.__dict__ for h in brain.search(q["q"], _int(q.get("limit"), 50), scope="conversations")],
             }
             if u.path in api:
                 return self._route(lambda: self._json(api[u.path]()))
@@ -153,15 +164,19 @@ def make_handler(brain: Brain):
                 elif u.path == "/api/task":
                     self._json(brain.add_task(b["text"], b.get("path") or None, b.get("due") or None, agent="you"))
                 elif u.path == "/api/task/toggle":
-                    self._json(brain.toggle_task(b["path"], int(b["line"]), b.get("text"), agent="you"))
+                    self._json(brain.toggle_task(b["path"], _int(b["line"], -1, lo=-1), b.get("text"), agent="you"))
                 elif u.path == "/api/import":
                     from .cli import import_allowed
                     export = b.get("file")
                     if not export and not import_allowed():
                         raise PermissionError("turn on 'Import my AI history' first")
                     if export:
-                        p = Path(export.strip().strip('"')).expanduser()
-                        if not p.is_file():
+                        p = Path(str(export).strip().strip('"')).expanduser()
+                        try:
+                            ok = p.is_file()
+                        except OSError:
+                            ok = False
+                        if not ok:
                             raise FileNotFoundError(f"no file at {p}")
                         self._json(Importer(brain).run(export=p))
                     else:
@@ -187,14 +202,14 @@ def make_handler(brain: Brain):
                         save_config(cfg)
                     if not cfg.get("backup_dir"):
                         raise ValueError("choose a backup folder first")
-                    self._json(_cloud().backup(brain.root, Path(cfg["backup_dir"]), keep=int(cfg.get("backup_keep", 30))))
+                    self._json(_cloud().backup(brain.root, Path(cfg["backup_dir"]), keep=_int(cfg.get("backup_keep"), 30, lo=1)))
                 elif u.path == "/api/research":
                     from . import research as R
                     srcs = b.get("sources") or list(R.DEFAULT_SOURCES)
-                    self._json(R.search(b["query"], srcs, int(b.get("per_source", 6))))
+                    self._json(R.search(b["query"], srcs, _int(b.get("per_source"), 6)))
                 elif u.path == "/api/fetch":
                     from . import research as R
-                    self._json(R.fetch(b["url"], int(b.get("max_chars", 30000))))
+                    self._json(R.fetch(b["url"], _int(b.get("max_chars"), 30000)))
                 elif u.path == "/api/research/save":
                     from datetime import date
                     from . import research as R
@@ -229,6 +244,15 @@ def make_handler(brain: Brain):
 IMPORT_EVERY = 300  # seconds
 
 
+def _int(v, default: int, lo: int = 0, hi: int = 100_000) -> int:
+    """Query/body numbers from the browser, clamped to a sane range (huge values overflow SQLite)."""
+    try:
+        n = int(float(v)) if v not in (None, "") else default
+    except (TypeError, ValueError, OverflowError):
+        n = default
+    return max(lo, min(n, hi))
+
+
 def _cfg() -> dict:
     from .cli import load_config
     return load_config()
@@ -246,7 +270,7 @@ def _auto_backup(brain: Brain, stop: threading.Event) -> None:
         try:
             cfg = _cfg()
             if _cloud().backup_due(cfg):
-                r = _cloud().backup(brain.root, Path(cfg["backup_dir"]), keep=int(cfg.get("backup_keep", 30)))
+                r = _cloud().backup(brain.root, Path(cfg["backup_dir"]), keep=_int(cfg.get("backup_keep"), 30, lo=1))
                 brain.log("cortex", "backed up", "", f"{r['files']} files to {Path(r['path']).name}")
                 print(f"Backup saved: {r['path']}")
         except Exception as e:
@@ -270,6 +294,34 @@ def _auto_import(brain: Brain, stop: threading.Event) -> None:
         stop.wait(IMPORT_EVERY)
 
 
+class _Server(ThreadingHTTPServer):
+    # On Windows, SO_REUSEADDR (Python's default for HTTP servers) lets a second program bind a
+    # port that is already in use, so two servers would silently share it. Exclusive on Windows.
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+
+def _running_cortex(port: int) -> bool:
+    try:
+        opener = __import__("urllib.request").request.build_opener(__import__("urllib.request").request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/api/setup", timeout=1.5) as r:
+            return "import_history" in json.loads(r.read())
+    except Exception:
+        return False
+
+
+def _bind(brain: Brain, port: int):
+    """Use the preferred port; if Cortex already runs there return (None, port); if some other
+    program holds it, take the next free port."""
+    for p in range(port, port + 20):
+        try:
+            return _Server(("127.0.0.1", p), make_handler(brain)), p
+        except OSError:
+            if _running_cortex(p):
+                return None, p
+    raise OSError(f"no free port between {port} and {port + 19}")
+
+
 def run(vault: str, port: int = 7777, open_browser: bool = True, auto_import: bool = True) -> None:
     brain = Brain(vault)
     info = brain.sync(force=True)
@@ -279,8 +331,14 @@ def run(vault: str, port: int = 7777, open_browser: bool = True, auto_import: bo
     prov = _cloud().provider_for(brain.root)
     if prov:
         print(f"Cloud: this brain lives in {prov['provider']} (search index kept locally at {brain.local_dir})")
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(brain))
+    httpd, port = _bind(brain, port)
     url = f"http://127.0.0.1:{port}"
+    if httpd is None:  # Cortex is already open: just show it
+        print(f"Cortex is already running at {url}; opening it.")
+        if open_browser:
+            webbrowser.open(url)
+        brain.close()
+        return
     print(f"Cortex is running at {url}")
     print(f"Vault: {brain.root}  ({info['notes']} notes indexed)")
     print("Press Ctrl+C to stop.")
