@@ -77,4 +77,10 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" Cortex-windows.zip Cortex-windows.zip.sha256.txt --repo "${{ github.repository }}" --title "Cortex ${{ github.ref_name }}" --generate-notes
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        # The release may already exist (created in the GitHub UI or API, which also creates the tag):
+        # then just attach the files.
+        run: |
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Cortex $TAG" --generate-notes
+          gh release upload "$TAG" Cortex-windows.zip Cortex-windows.zip.sha256.txt --repo "$REPO" --clobber
