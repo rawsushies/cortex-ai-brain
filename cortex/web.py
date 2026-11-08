@@ -121,6 +121,9 @@ def make_handler(brain: Brain):
                 "/api/version": lambda: {"content": brain.version(q["path"], q["id"])},
                 "/api/import/status": lambda: Importer(brain).status(),
                 "/api/sync": lambda: _cloud().status(brain, _cfg()),
+                "/api/setup": lambda: {"import_history": _cfg().get("import_history"),
+                                       "connected": bool(_cfg().get("connected_at")),
+                                       "detected": Importer(brain).status()["detected"]},
                 "/api/conversations": lambda: brain.recent(int(q.get("limit", 200)), conversations="only") if not q.get("q")
                     else [h.__dict__ for h in brain.search(q["q"], int(q.get("limit", 50)), scope="conversations")],
             }
@@ -152,7 +155,10 @@ def make_handler(brain: Brain):
                 elif u.path == "/api/task/toggle":
                     self._json(brain.toggle_task(b["path"], int(b["line"]), b.get("text"), agent="you"))
                 elif u.path == "/api/import":
+                    from .cli import import_allowed
                     export = b.get("file")
+                    if not export and not import_allowed():
+                        raise PermissionError("turn on 'Import my AI history' first")
                     if export:
                         p = Path(export.strip().strip('"')).expanduser()
                         if not p.is_file():
@@ -160,6 +166,16 @@ def make_handler(brain: Brain):
                         self._json(Importer(brain).run(export=p))
                     else:
                         self._json(Importer(brain).run())
+                elif u.path == "/api/settings":
+                    from .cli import save_config
+                    cfg = _cfg()
+                    if "import_history" in b:
+                        cfg["import_history"] = bool(b["import_history"])
+                    save_config(cfg)
+                    self._json({"import_history": cfg.get("import_history")})
+                elif u.path == "/api/connect":
+                    from .cli import connect_hosts
+                    self._json(connect_hosts(brain.root))
                 elif u.path == "/api/backup":
                     cfg = _cfg()
                     if b.get("dir"):
@@ -240,7 +256,11 @@ def _auto_backup(brain: Brain, stop: threading.Event) -> None:
 
 def _auto_import(brain: Brain, stop: threading.Event) -> None:
     """Keep conversations from every AI app flowing in while the app is open."""
+    from .cli import import_allowed
     while not stop.is_set():
+        if not import_allowed():  # nothing is read until the user says yes in the app
+            stop.wait(15)
+            continue
         try:
             r = Importer(brain).run()
             if r.get("new") or r.get("updated"):

@@ -177,9 +177,19 @@ def cmd_init(args) -> None:
 
 
 # ── connect ─────────────────────────────────────────────────────────────
+FROZEN = bool(getattr(sys, "frozen", False))  # running as the packaged Cortex.exe
+
+
 def _server_entry(vault: Path, agent: str) -> dict:
-    return {"command": sys.executable, "args": [str(RUN_PY), "mcp", "--vault", str(vault)],
-            "env": {"CORTEX_AGENT": agent}}
+    # Packaged app: AI apps launch Cortex.exe itself. From source: python run.py.
+    args = ["mcp", "--vault", str(vault)] if FROZEN else [str(RUN_PY), "mcp", "--vault", str(vault)]
+    return {"command": sys.executable, "args": args, "env": {"CORTEX_AGENT": agent}}
+
+
+def import_allowed(cfg: dict | None = None) -> bool:
+    """Reading other apps' chat history happens only after the user said yes (in the app or CLI)."""
+    cfg = load_config() if cfg is None else cfg
+    return cfg.get("import_history") is True
 
 
 def _backup(p: Path) -> None:
@@ -239,8 +249,8 @@ def _claude_code(vault: Path) -> str:
     return "connected" if r.returncode == 0 else f"failed: {(r.stderr or r.stdout).strip()}"
 
 
-def cmd_connect(args) -> None:
-    vault = vault_path(args.vault)
+def connect_hosts(vault: Path, everything: bool = False) -> list[dict]:
+    """Register the brain with every AI app found on this computer. Returns one result per app."""
     appdata = Path(os.environ.get("APPDATA", HOME / "AppData" / "Roaming"))
     claude_desktop = (appdata / "Claude" if os.name == "nt"
                       else HOME / "Library" / "Application Support" / "Claude" if sys.platform == "darwin"
@@ -252,12 +262,27 @@ def cmd_connect(args) -> None:
         ("Cursor", lambda: _merge_json(HOME / ".cursor" / "mcp.json", vault, "cursor"), HOME / ".cursor"),
         ("Claude Desktop", lambda: _merge_json(claude_desktop / "claude_desktop_config.json", vault, "claude-desktop"), claude_desktop),
     ]
-    print(f"Connecting AIs to {vault}\n")
+    out = []
     for name, fn, marker in hosts:
-        if marker is not None and not marker.exists() and not args.all:
-            print(f"  {name:15} not installed (skipped)")
+        if marker is not None and not marker.exists() and not everything:
+            out.append({"app": name, "status": "not installed (skipped)", "ok": None})
             continue
-        print(f"  {name:15} {fn()}")
+        try:
+            status = fn()
+        except OSError as e:
+            status = f"failed: {e}"
+        out.append({"app": name, "status": status, "ok": status.startswith(("connected", "already"))})
+    cfg = load_config()
+    cfg["connected_at"] = datetime.now().isoformat(timespec="seconds")
+    save_config(cfg)
+    return out
+
+
+def cmd_connect(args) -> None:
+    vault = vault_path(args.vault)
+    print(f"Connecting AIs to {vault}\n")
+    for r in connect_hosts(vault, args.all):
+        print(f"  {r['app']:15} {r['status']}")
     print("\nRestart each AI app so it picks up the brain. Ask it: \"what's in my brain?\"")
 
 
@@ -393,6 +418,9 @@ def main(argv=None) -> None:
         return cmd_restore(args)
     if cmd == "connect":
         return cmd_connect(args)
+    if cmd == "app" and not (getattr(args, "vault", None) or os.environ.get("CORTEX_VAULT") or load_config().get("vault")):
+        # First launch (e.g. double-clicking Cortex.exe): create the brain in Documents\Cortex.
+        cmd_init(argparse.Namespace(vault=None))
     vault = vault_path(getattr(args, "vault", None))
     if cmd != "mcp":
         upgrade_rules(vault)
@@ -407,6 +435,10 @@ def main(argv=None) -> None:
         if args.file:
             r = imp.run(export=Path(args.file).expanduser())
         else:
+            cfg = load_config()
+            if not import_allowed(cfg):  # running this command IS the user's yes
+                cfg["import_history"] = True
+                save_config(cfg)
             st = imp.status()["detected"]
             print("Found: " + (", ".join(k for k, v in st.items() if v) or "no AI apps with saved conversations"))
             r = imp.run(set(args.only.split(",")) if args.only else None)

@@ -188,13 +188,14 @@ function activityRow(a) {
 async function viewHome() {
   setTop("<b>Home</b>", `<button class="btn primary" id="homeNew">New note</button>`);
   $("#homeNew").onclick = () => newNote();
-  const [stats, recent, acts] = await Promise.all([get("/api/stats"), get("/api/recent?limit=12"), get("/api/activity?limit=12")]);
+  const [stats, recent, acts, setup] = await Promise.all([get("/api/stats"), get("/api/recent?limit=12"), get("/api/activity?limit=12"), get("/api/setup")]);
   const agents = new Set(acts.map((a) => a.agent).filter((a) => a !== "you" && a !== "human"));
   const hour = new Date().getHours();
   const greet = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
   view.innerHTML = `
     <h1 class="hello">${greet}.</h1>
     <p class="sub">Your brain is shared by every AI you connect. Here's what's been happening.</p>
+    ${setupCard(setup)}
     <div class="stats">
       <div class="stat"><div class="n">${stats.notes.toLocaleString()}</div><div class="l">notes</div></div>
       <a class="stat" href="#/tasks"><div class="n">${stats.open_tasks.toLocaleString()}</div><div class="l">open tasks</div></a>
@@ -208,9 +209,44 @@ async function viewHome() {
       </div>
       <div>
         <h3 class="panel-title">AI activity <a href="#/activity">See all</a></h3>
-        <div class="list">${acts.map(activityRow).join("") || `<div class="empty"><b>Quiet so far</b>Run <code>python run.py connect</code>, then ask an AI to remember something.</div>`}</div>
+        <div class="list">${acts.map(activityRow).join("") || `<div class="empty"><b>Quiet so far</b>Connect your AI apps, then ask one to remember something.</div>`}</div>
       </div>
     </div>`;
+  wireSetup();
+}
+
+function setupCard(st) {
+  if (st.connected && st.import_history !== null && st.import_history !== undefined) return "";
+  const apps = Object.entries(st.detected).filter(([, v]) => v).map(([k]) => ({ "claude-code": "Claude Code", codex: "Codex", gemini: "Gemini CLI", cursor: "Cursor" }[k]));
+  return `<div class="setup">
+    <h3>Finish setting up</h3>
+    ${st.connected ? "" : `<div class="setup-step"><div><b>1. Connect your AI apps</b><p>Lets Claude Code, Codex, Gemini, Cursor and Claude Desktop use this brain. Cortex adds itself to each app's settings (a backup of each file is kept).</p><div id="connectOut"></div></div>
+      <button class="btn primary" id="doConnect">Connect my AI apps</button></div>`}
+    ${st.import_history === null || st.import_history === undefined ? `<div class="setup-step"><div><b>${st.connected ? "" : "2. "}Import your AI conversation history?</b>
+      <p>Cortex can read the chat history your AI apps already keep on this PC${apps.length ? ` (found: ${apps.map(esc).join(", ")})` : ""}, remove passwords and keys, and save every conversation as searchable notes. Nothing is read until you say yes, and it stays on this computer unless you turn on cloud sync.</p></div>
+      <div class="setup-btns"><button class="btn primary" id="importYes">Yes, import</button><button class="btn" id="importNo">No thanks</button></div></div>` : ""}
+  </div>`;
+}
+
+function wireSetup() {
+  const c = $("#doConnect");
+  if (c) c.onclick = async () => {
+    c.textContent = "Connecting…"; c.disabled = true;
+    try {
+      const res = await post("/api/connect", {});
+      $("#connectOut").innerHTML = `<ul class="connect-res">${res.map((r) => `<li class="${r.ok ? "ok" : r.ok === false ? "bad" : ""}"><b>${esc(r.app)}</b>: ${esc(r.status)}</li>`).join("")}</ul><p class="p">Restart your AI apps so they pick up the brain.</p>`;
+      c.remove();
+    } catch (e) { toast(e.message, true); c.textContent = "Connect my AI apps"; c.disabled = false; }
+  };
+  const choose = async (yes) => {
+    try {
+      await post("/api/settings", { import_history: yes });
+      if (yes) { toast("Importing your AI history…"); post("/api/import", {}).then((r) => { toast(`Imported ${r.new || 0} conversations`); loadSidebar(); }).catch(() => {}); }
+      else toast("OK. You can turn it on later in Conversations");
+      viewHome();
+    } catch (e) { toast(e.message, true); }
+  };
+  if ($("#importYes")) { $("#importYes").onclick = () => choose(true); $("#importNo").onclick = () => choose(false); }
 }
 
 async function viewActivity(filter) {
@@ -366,6 +402,7 @@ function sourceChip(name) {
 
 async function viewConversations(query = "") {
   setTop("<b>Conversations</b>", `<button class="btn" id="importNow">Import now</button>`);
+  const setup = await get("/api/setup");
   const [st, list] = await Promise.all([get("/api/import/status"),
     get(query ? "/api/conversations?q=" + encodeURIComponent(query) : "/api/conversations?limit=300")]);
   const names = { "claude-code": "Claude Code", codex: "Codex", gemini: "Gemini CLI", cursor: "Cursor", chatgpt: "ChatGPT", "claude-ai": "Claude.ai" };
@@ -374,6 +411,9 @@ async function viewConversations(query = "") {
   view.innerHTML = `
     <h1 class="hello">Everything you've said to any AI</h1>
     <p class="sub">Every conversation from your AI apps, in full and searchable by you and by every connected AI. New ones come in automatically every few minutes while Cortex is open, and whenever an AI starts.</p>
+    ${setup.import_history === true ? "" : `<div class="sync-card warn" style="margin-bottom:14px"><b>Importing is off</b>
+      <p>Cortex doesn't read your AI apps' chat history until you allow it.</p>
+      <button class="btn primary" id="allowImport" style="margin-top:8px">Import my AI history</button></div>`}
     <div class="conv-head">
       <div>${counts || "No conversations imported yet."}</div>
       <div class="p">${found.length ? "Found on this computer: " + found.join(", ") : "No AI apps with saved history found on this computer yet."}${st.last_run ? " · last import " + ago(st.last_run) : ""}</div>
@@ -392,6 +432,12 @@ async function viewConversations(query = "") {
       <form class="task-add" id="exportForm"><input id="exportPath" placeholder="C:\\Users\\you\\Downloads\\chatgpt-export.zip" required><button class="btn primary">Import file</button></form>
     </details>`;
   $("#convSearch").onsubmit = (e) => { e.preventDefault(); viewConversations($("#convQ").value.trim()); };
+  if ($("#allowImport")) $("#allowImport").onclick = async () => {
+    await post("/api/settings", { import_history: true });
+    $("#allowImport").textContent = "Importing…";
+    try { const r = await post("/api/import", {}); toast(`Imported ${r.new || 0} conversations`); } catch (e) { toast(e.message, true); }
+    await loadSidebar(); viewConversations();
+  };
   $("#importNow").onclick = async () => {
     $("#importNow").textContent = "Importing…";
     try { const r = await post("/api/import", {}); toast(r.skipped ? r.skipped : `${r.new} new, ${r.updated} updated`); await loadSidebar(); viewConversations(query); }

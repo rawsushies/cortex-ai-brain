@@ -12,16 +12,24 @@
 - **Fast.** On a 5,000-note vault: search 10ms, save (with a version snapshot) 1ms, full health check 100ms, re-check for changed files 80ms.
 - **Nothing to install** except Python 3.10+. It uses no packages, no cloud and no account. The app only listens on your own computer.
 
-## Install (Windows)
+## Install (Windows): Cortex.exe
 
-1. Install [Python](https://www.python.org/downloads/) and tick **"Add python.exe to PATH"**.
-2. Put this `cortex` folder somewhere permanent, for example `Documents\cortex`. Your AI apps will point at this location, so don't move it afterwards.
-3. Double-click **`Cortex.bat`**.
-   - The first time, it asks where your brain should live. Press Enter for `Documents\Cortex`, or paste the path of an Obsidian vault you already have.
-   - It connects every AI app it finds, then opens the app in your browser.
-4. Restart your AI apps and ask one: *"What's in my brain?"*
+No Python needed.
 
-To open Cortex later, double-click `Cortex.bat` again.
+1. Download **`Cortex-windows.zip`** from this repo's [Releases](../../releases), or from the latest successful build under [Actions → Build Windows app](../../actions/workflows/build-windows.yml).
+2. **Right-click the zip → Properties → tick "Unblock" → OK**, then extract it somewhere permanent, for example `Documents\Cortex app`. Your AI apps will point at this folder, so don't move it afterwards.
+3. Double-click **`Cortex.exe`**. The first time, it creates your brain in `Documents\Cortex` and opens the app.
+4. On the Home page, click **Connect my AI apps**, and choose whether to **import your AI history**. Then restart your AI apps and ask one: *"What's in my brain?"*
+
+**"Windows protected your PC"?** Cortex is free and not code-signed (a signing certificate costs a few hundred dollars a year), so Windows SmartScreen doesn't recognise it yet. Click **More info → Run anyway**. You only need to do this once.
+
+**Antivirus warning?** Cortex reads other AI apps' chat history (only after you click *Yes, import*), recognises API-key patterns (to redact them), and edits AI apps' settings (when you click *Connect*). On paper that resembles spyware, so some scanners flag it. Don't just trust that, check it:
+- Compare the zip's SHA-256 with `Cortex-windows.zip.sha256.txt` from the same release (`certutil -hashfile Cortex-windows.zip SHA256`).
+- Upload it to [virustotal.com](https://www.virustotal.com). A lone vague detection (`Wacatac`, `!ml`, `Generic`) means a false positive.
+- Report false positives to your antivirus vendor (Microsoft: [wdsi/filesubmission](https://www.microsoft.com/en-us/wdsi/filesubmission)).
+- The full source is in this repo, and every `.exe` is built from it by GitHub on its own Windows machines (see the workflow), never on someone's PC.
+
+**From source instead:** install [Python](https://www.python.org/downloads/) (tick "Add python.exe to PATH") and double-click `Cortex.bat`.
 
 ## Install (Mac / Linux)
 

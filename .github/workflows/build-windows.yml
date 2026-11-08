@@ -1,0 +1,80 @@
+name: Build Windows app
+
+# Builds Cortex.exe on a real Windows machine: tests -> build -> smoke test -> zip.
+# Push a tag like v1.5.0 to publish the zip as a GitHub Release download.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CORTEX_SEMANTIC: "off"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the test suite on Windows
+        run: python -m unittest discover tests -v
+
+      - name: Build Cortex.exe
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller==6.16.0"
+          pyinstaller --noconfirm --clean packaging/cortex.spec
+
+      - name: Smoke test the exe (MCP + app start-up)
+        shell: pwsh
+        run: |
+          $vault = Join-Path $env:RUNNER_TEMP "smoke-vault"
+          $req = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+          $out = $req | & dist\Cortex\Cortex.exe mcp --vault $vault
+          Write-Host $out
+          if ($out -notmatch "brain_recall") { throw "MCP server did not answer" }
+          $env:CORTEX_VAULT = $vault
+          $p = Start-Process dist\Cortex\Cortex.exe -ArgumentList "app","--port","7790","--no-browser","--no-import" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 6
+          $html = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:7790/).Content
+          Stop-Process -Id $p.Id -Force
+          if ($html -notmatch "<title>Cortex</title>") { throw "app did not serve its page" }
+          Write-Host "Cortex.exe works"
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist\Cortex\README.md
+          Compress-Archive -Path dist\Cortex -DestinationPath Cortex-windows.zip
+          (Get-FileHash Cortex-windows.zip -Algorithm SHA256).Hash | Out-File -Encoding ascii Cortex-windows.zip.sha256.txt
+          Get-Content Cortex-windows.zip.sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cortex-windows
+          path: |
+            Cortex-windows.zip
+            Cortex-windows.zip.sha256.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Cortex-windows
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" Cortex-windows.zip Cortex-windows.zip.sha256.txt --repo "${{ github.repository }}" --title "Cortex ${{ github.ref_name }}" --generate-notes

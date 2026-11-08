@@ -470,7 +470,7 @@ class Server:
                 result = {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}, "prompts": {}},
-                    "serverInfo": {"name": "cortex", "version": "1.4.0"},
+                    "serverInfo": {"name": "cortex", "version": "1.5.0"},
                     "instructions": "Cortex is the user's shared second brain. Call brain_context at the start, search before writing, prefer brain_edit over overwriting, and brain_log when you finish meaningful work.",
                 }
             elif method == "ping":
@@ -562,7 +562,8 @@ def run(vault: str, agent: str | None = None) -> None:
         except AttributeError:
             pass
     brain = Brain(vault)
-    if os.environ.get("CORTEX_AUTO_IMPORT", "on").lower() not in ("off", "0", "false", "no"):
+    from .cli import import_allowed
+    if import_allowed() and os.environ.get("CORTEX_AUTO_IMPORT", "on").lower() not in ("off", "0", "false", "no"):
         # Every time an AI starts, pull in conversations from all apps (incremental: usually ~0 ms).
         import threading
         from .importers import Importer

@@ -224,6 +224,19 @@ a.stat:hover { border-color: var(--faint); }
 .reader h2 { font: 650 24px/1.25 var(--serif); margin: 14px 0 4px; }
 .reader .p { color: var(--faint); font-size: 12.5px; margin: 0 0 12px; }
 
+/* first-run setup */
+.setup { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: var(--radius); padding: 14px 18px; margin: 0 0 24px; }
+.setup h3 { margin: 0 0 4px; font-size: 15px; }
+.setup-step { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.setup-step:first-of-type { border-top: 0; }
+.setup-step p { margin: 4px 0 0; color: var(--muted); font-size: 13px; max-width: 720px; }
+.setup-btns { display: flex; gap: 6px; flex: none; }
+.setup-step .btn { flex: none; }
+.connect-res { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+.connect-res li.ok b { color: var(--codex); }
+.connect-res li.bad b { color: var(--danger); }
+@media (max-width: 760px) { .setup-step { flex-direction: column; } }
+
 /* sync */
 .sync-card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 18px; }
 .sync-card p { margin: 6px 0 0; color: var(--muted); }

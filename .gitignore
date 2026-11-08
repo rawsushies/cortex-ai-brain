@@ -7,3 +7,8 @@ __pycache__/
 *.db-shm
 .trash/
 .venv/
+
+# build output
+build/
+dist/
+packaging/build_version_info.txt
