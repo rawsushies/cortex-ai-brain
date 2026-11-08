@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cortex</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%237c6cf2'/><circle cx='11' cy='13' r='3' fill='white'/><circle cx='21' cy='12' r='2.5' fill='white'/><circle cx='17' cy='21' r='3' fill='white'/></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <span class="brand-name">Cortex</span>
+      <button class="icon-btn theme-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    </div>
+
+    <form class="capture" id="captureForm" autocomplete="off">
+      <input id="captureInput" placeholder="Capture a thought…  ↵" aria-label="Quick capture to today's note">
+    </form>
+
+    <button class="search-trigger" id="searchBtn">
+      <span>Search</span><kbd>Ctrl K</kbd>
+    </button>
+
+    <nav class="nav" aria-label="Views">
+      <a href="#/" data-view="home"><span class="ni">⌂</span>Home</a>
+      <a href="#/tasks" data-view="tasks"><span class="ni">☑</span>Tasks<span class="count" id="taskCount"></span></a>
+      <a href="#/conversations" data-view="conversations"><span class="ni">❝</span>Conversations<span class="count" id="convCount"></span></a>
+      <a href="#/research" data-view="research"><span class="ni">⌕</span>Research</a>
+      <a href="#/activity" data-view="activity"><span class="ni">◷</span>AI activity</a>
+      <a href="#/graph" data-view="graph"><span class="ni">✶</span>Graph</a>
+      <a href="#/health" data-view="health"><span class="ni">♡</span>Health</a>
+      <a href="#/sync" data-view="sync"><span class="ni">☁</span>Sync &amp; backup</a>
+      <button class="nav-new" id="newBtn"><span class="ni">＋</span>New note</button>
+    </nav>
+
+    <div class="side-section">
+      <div class="side-title">Notes</div>
+      <div class="tree" id="tree"></div>
+    </div>
+
+    <div class="side-section">
+      <div class="side-title">Tags</div>
+      <div class="tags" id="tagList"></div>
+    </div>
+
+    <div class="side-foot" id="sideFoot"></div>
+  </aside>
+
+  <main class="main" id="main" tabindex="-1">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menuBtn" aria-label="Open menu">☰</button>
+      <div class="crumbs" id="crumbs"></div>
+      <div class="top-actions" id="topActions"></div>
+    </header>
+    <section class="view" id="view"></section>
+  </main>
+</div>
+
+<div class="palette-wrap" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Search notes">
+    <input id="paletteInput" placeholder="Search your brain, or type a new note name…" autocomplete="off" spellcheck="false">
+    <ul id="paletteList" role="listbox"></ul>
+    <div class="palette-hint"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> open</span><span><kbd>Esc</kbd> close</span></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

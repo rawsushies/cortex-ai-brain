@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# A vault's machine-local and private data never belongs in this repo
+.cortex/
+*.db
+*.db-wal
+*.db-shm
+.trash/
+.venv/
