@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -52,6 +53,10 @@ MAX_NAME_BYTES = 150  # per file/folder name (file systems allow 255; leave room
 MAX_REL_PATH = 200  # vault-relative; keeps full paths under Windows' 260-character limit
 HEADING_WEIGHT = 6  # recall: a query word in a passage heading counts like this many mentions
 HISTORY_KEEP = 30  # versions kept per note
+CHANGES_SCAN = 4000  # journal lines read per device when looking up a change-set
+FILE_ACTIONS = {"created", "updated", "appended", "edited", "moved", "deleted", "restored", "completed task",
+                "reopened task", "imported", "backed up", "undid"}
+ACTOR = re.compile(r"^[a-z0-9][a-z0-9_.:/-]{0,47}$")
 ACTIVE_STATUSES = {"active", "in progress", "in-progress", "doing", "ongoing", "open"}
 
 SCHEMA = """
@@ -206,6 +211,11 @@ class Brain:
         self._names: dict[str, str] | None = None
         self._text_cache: dict[str, tuple[float, str]] = {}
         self._recall_cache: dict[tuple, dict] = {}
+        self._norms: dict[str, tuple[str, str]] | None = None  # path -> normalized (stem, title), for the duplicate guard
+        self._gen = 0  # bumped on every index change: cheap cache key for recall
+        self._cs_local = threading.local()
+        self.changes_dir = self.meta_dir / "changes"
+        self.listeners: list = []  # callables(event: dict), see emit()
         self.db = self._open_index()
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -360,6 +370,9 @@ class Brain:
         db.executemany("INSERT INTO links(src,dst,dst_l) VALUES(?,?,?)", [(rel, l, l.lower()) for l in links])
         db.executemany("INSERT INTO tasks(path,line,text,done,due) VALUES(?,?,?,?,?)", tasks)
         self._names_add(rel, title)
+        if self._norms is not None:
+            self._norms[rel] = (norm_title(rel.rsplit("/", 1)[-1][:-3]), norm_title(title))
+        self._gen += 1
 
     def _names_add(self, rel: str, title: str) -> None:
         """Keep the link-name map current without rebuilding it (rebuilds cost ~0.3s at 100k notes)."""
@@ -382,6 +395,9 @@ class Brain:
         self.db.execute("DELETE FROM links WHERE src=?", (rel,))
         self.db.execute("DELETE FROM tasks WHERE path=?", (rel,))
         self._names = None
+        if self._norms is not None:
+            self._norms.pop(rel, None)
+        self._gen += 1
 
     def _name_map(self) -> dict[str, str]:
         """lowercased path / path-without-.md / filename / title -> note path.
@@ -561,8 +577,7 @@ class Brain:
         return text
 
     def _version_key(self) -> tuple:
-        r = self.db.execute("SELECT count(*), coalesce(max(mtime),0), coalesce(sum(size),0) FROM notes").fetchone()
-        return tuple(r)
+        return (self._gen,)  # O(1); the index changes only through _index_one/_drop
 
     def _idf(self, terms: list[str]) -> dict[str, float]:
         import math
@@ -792,17 +807,24 @@ class Brain:
             raise ValueError("bad history path")
         return d
 
-    def _snapshot(self, p: Path, agent: str) -> None:
+    def _snapshot(self, p: Path, agent: str) -> str | None:
+        """Copy the current version into history; returns its version id."""
         if not p.exists():
-            return
+            return None
         d = self._hist_dir(self.rel(p))
         d.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        safe_agent = re.sub(r"[^\w-]", "", agent)[:24] or "unknown"
-        shutil.copy2(p, d / f"{stamp}__{safe_agent}.md")
+        safe_agent = re.sub(r"[^\w-]", "-", agent)[:24].strip("-") or "unknown"
+        while True:  # two snapshots in the same microsecond must not overwrite each other
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            dest = d / f"{stamp}__{safe_agent}.md"
+            if not dest.exists():
+                break
+            time.sleep(0.000002)
+        shutil.copy2(p, dest)
         versions = sorted(d.glob("*.md"))
         for old in versions[:-HISTORY_KEEP]:
             old.unlink(missing_ok=True)
+        return dest.name
 
     def history(self, path: str) -> list[dict]:
         rel = path if path.endswith(".md") else path + ".md"
@@ -826,6 +848,163 @@ class Brain:
         if not f.is_file() or f.is_symlink():
             raise FileNotFoundError(vid)
         return f.read_text(encoding="utf-8", errors="replace")
+
+    def read_as_of(self, path: str, when: str) -> dict:
+        """The note as it was at a moment in time (ISO date or date-time), from its history."""
+        found = self.find(path) or path
+        try:
+            t = datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("as_of must be a date like 2026-11-08 or 2026-11-08T14:30")
+        if t.tzinfo is not None:
+            t = t.astimezone().replace(tzinfo=None)
+        if len(when.strip()) == 10:  # a bare date means the end of that day
+            t = t.replace(hour=23, minute=59, second=59)
+        for v in reversed(self.history(found)):  # oldest first
+            if datetime.fromisoformat(v["saved"]) > t:  # this version was still current at `when`
+                return {"path": found, "as_of": when, "version": v["id"], "content": self.version(found, v["id"])}
+        p = self.resolve(found)
+        if not p.exists():
+            raise FileNotFoundError(f"no note named {path!r}")
+        if datetime.fromtimestamp(p.stat().st_mtime) > t and not self.history(found):
+            created = self.db.execute("SELECT created FROM notes WHERE path=?", (found,)).fetchone()
+            if created and created["created"] and datetime.fromtimestamp(created["created"]) > t:
+                raise FileNotFoundError(f"{found} didn't exist yet at {when}")
+        return {"path": found, "as_of": when, "version": "current", "content": p.read_text(encoding="utf-8", errors="replace")}
+
+    # ── change-sets: every change through Cortex can be undone as one unit ──
+    @contextmanager
+    def changeset(self, actor: str, summary: str = ""):
+        """Group every write inside the block into one undoable change-set. Nested calls join
+        the outer one. The journal lives in .cortex/changes/<DEVICE>.jsonl (synced, per device)."""
+        cur = getattr(self._cs_local, "cs", None)
+        if cur is not None:
+            yield cur
+            return
+        cs = {"id": "cs-" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + os.urandom(3).hex(),
+              "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds"),
+              "actor": actor, "device": DEVICE, "summary": summary[:200], "files": []}
+        self._cs_local.cs = cs
+        try:
+            yield cs
+        finally:
+            self._cs_local.cs = None
+            if cs["files"]:
+                self.changes_dir.mkdir(exist_ok=True)
+                with self._lock, open(self.changes_dir / f"{DEVICE}.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(cs, ensure_ascii=False) + "\n")
+                self.emit({"type": "changed", "changeset": cs["id"], "actor": actor,
+                           "paths": [x["path"] for x in cs["files"]], "undo_of": cs.get("undo_of")})
+
+    def current_changeset(self) -> str | None:
+        cs = getattr(self._cs_local, "cs", None)
+        return cs["id"] if cs else None
+
+    def _record(self, rel: str, before: str | None, p: Path | None, moved_from: str | None = None) -> None:
+        cs = getattr(self._cs_local, "cs", None)
+        if cs is None:
+            return
+        after = _file_sha(p) if p is not None else None
+        if not moved_from:
+            for f in cs["files"]:
+                if f["path"] == rel:  # touched twice in one change-set: keep the first "before"
+                    f["after"] = after
+                    if p is None:
+                        f["deleted"] = True
+                    return
+        entry = {"path": rel, "before": before, "after": after}
+        if p is None:
+            entry["deleted"] = True
+        if moved_from:
+            entry["moved_from"] = moved_from
+        cs["files"].append(entry)
+
+    def changesets(self, limit: int = 50, actor: str | None = None) -> list[dict]:
+        """Recent change-sets, newest first, each marked undone if a later change-set reverted it."""
+        files = list(self.changes_dir.glob("*.jsonl")) if self.changes_dir.is_dir() else []
+        keyed = [(_ts_key(e.get("ts", "")), i, e) for f in files for i, e in enumerate(self._tail(f, CHANGES_SCAN))
+                 if isinstance(e, dict) and e.get("id")]
+        keyed.sort(key=lambda x: (x[0], x[1]), reverse=True)  # time, then order in the device's journal
+        rows = [e for _, _, e in keyed]
+        undone: dict[str, str] = {}
+        for e in reversed(rows):  # oldest first: an undo of an undo re-does
+            if e.get("undo_of"):
+                if e["undo_of"] in undone:
+                    undone.pop(e["undo_of"])
+                    undone.pop(e["id"], None)
+                else:
+                    undone[e["undo_of"]] = e["id"]
+        out = []
+        for e in rows:
+            if actor and not _actor_match(e.get("actor", ""), actor):
+                continue
+            out.append({**e, "undone": e["id"] in undone})
+            if len(out) >= limit:
+                break
+        return out
+
+    def undo(self, changeset: str | None = None, agent: str = "human", last_by: str | None = None,
+             force: bool = False) -> dict:
+        """Revert a change-set: by id, or the latest one by an actor (or anyone). Files changed
+        again since then are left alone and reported (force=True reverts them anyway)."""
+        sets = self.changesets(CHANGES_SCAN)
+        if changeset:
+            target = next((c for c in sets if c["id"] == changeset), None)
+            if not target:
+                raise FileNotFoundError(f"no change-set {changeset!r}")
+        else:
+            target = next((c for c in sets if not c["undone"] and not c.get("undo_of")
+                           and (not last_by or _actor_match(c.get("actor", ""), last_by))), None)
+            if not target:
+                raise FileNotFoundError("nothing to undo" + (f" by {last_by}" if last_by else ""))
+        reverted, skipped = [], []
+        with self.changeset(agent, f"undo {target['id']}") as cs:
+            cs["undo_of"] = target["id"]
+            for f in reversed(target.get("files", [])):
+                rel = f["path"]
+                try:
+                    p = self.resolve(rel)
+                    if not force and (_file_sha(p) if p.exists() else None) != f.get("after"):
+                        skipped.append({"path": rel, "reason": "changed again since"})
+                        continue
+                    old = None
+                    if f.get("before"):
+                        for cand in (rel, f.get("moved_from")):
+                            if not cand:
+                                continue
+                            try:
+                                old = self.version(cand, f["before"])
+                                break
+                            except FileNotFoundError:
+                                continue
+                        if old is None:
+                            skipped.append({"path": rel, "reason": "that version is no longer in history"})
+                            continue
+                    if f.get("moved_from"):
+                        self.move(rel, f["moved_from"], agent=agent)
+                        rel = f["moved_from"]
+                        if old is not None and self.resolve(rel).read_text(encoding="utf-8", errors="replace") != old:
+                            self.write(rel, old, agent=agent, mode="overwrite", log=False)
+                    elif old is None:
+                        if p.exists():
+                            self.delete(rel, agent=agent)
+                    else:
+                        self.write(rel, old, agent=agent, mode="overwrite", log=False)
+                    reverted.append(rel)
+                except (OSError, ValueError, PermissionError) as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+        if reverted:
+            self.log(agent, "undid", target["id"], f"{target.get('actor', '?')}: {len(reverted)} file(s)")
+        return {"undone": target["id"], "actor": target.get("actor"), "reverted": reverted, "skipped": skipped,
+                "changeset": cs["id"] if reverted else None}
+
+    def emit(self, event: dict) -> None:
+        """Tell listeners (the MCP server, the web app) that something changed."""
+        for fn in list(self.listeners):
+            try:
+                fn(event)
+            except Exception:
+                pass
 
     def restore(self, path: str, vid: str, agent: str = "you") -> dict:
         content = self.version(path, vid)
@@ -874,13 +1053,19 @@ class Brain:
         stem = norm_title(Path(path).stem)
         if len(stem) < 3:
             return []
+        if self._norms is None:
+            self._norms = {r["path"]: (norm_title(r["path"].rsplit("/", 1)[-1][:-3]), norm_title(r["title"]))
+                           for r in self.db.execute("SELECT path,title FROM notes")}
         out = []
-        for r in self.db.execute("SELECT path,title FROM notes"):
-            for cand in (norm_title(Path(r["path"]).stem), norm_title(r["title"])):
-                if cand and (cand == stem or (len(stem) >= 5 and (stem in cand or cand in stem))):
-                    out.append(r["path"])
+        long = len(stem) >= 5
+        for path, cands in self._norms.items():
+            for cand in cands:
+                if cand and (cand == stem or (long and (stem in cand or cand in stem))):
+                    out.append(path)
                     break
-        return out[:5]
+            if len(out) >= 5:
+                break
+        return out
 
     def write(self, path: str, content: str, agent: str = "human", mode: str = "overwrite",
               expect_mtime: float | None = None, log: bool = True) -> dict:
@@ -891,7 +1076,7 @@ class Brain:
             raise ValueError("mode must be overwrite, append or create")
         p = self.resolve(path)
         self.check_agent_write(self.rel(p), agent)
-        with self._lock:
+        with self.changeset(agent) as cs, self._lock:
             existed = p.exists()
             if mode == "create" and existed:
                 raise FileExistsError(f"{self.rel(p)} already exists")
@@ -902,21 +1087,24 @@ class Brain:
                 old = p.read_text(encoding="utf-8", errors="replace")
                 sep = "" if old.endswith("\n\n") else ("\n" if old.endswith("\n") else "\n\n")
                 content = old + sep + content
-            self._snapshot(p, agent)
+            before = self._snapshot(p, agent)
             self._atomic_write(p, content)
-            self._index_one(p, p.stat())
+            st = p.stat()
+            self._index_one(p, st)
             self.db.commit()
+            self._record(self.rel(p), before, p)
         rel = self.rel(p)
         action = "appended" if mode == "append" and existed else ("updated" if existed else "created")
         if log:
             self.log(agent, action, rel)
         self.semantic.kick()
-        out = {"path": rel, "action": action}
+        out = {"path": rel, "action": action, "changeset": cs["id"], "mtime": st.st_mtime}
         if similar:
             out["similar"] = similar
         return out
 
-    def edit(self, path: str, find: str, replace: str, agent: str = "human", all: bool = False) -> dict:
+    def edit(self, path: str, find: str, replace: str, agent: str = "human", all: bool = False,
+             expect_mtime: float | None = None) -> dict:
         """Exact find-and-replace inside one note (cheap, precise, no full rewrite)."""
         rel = self._must_find(path)
         p = self.resolve(rel)
@@ -927,35 +1115,21 @@ class Brain:
         if n > 1 and not all:
             raise ValueError(f"the text appears {n} times; include more surrounding text or set all=true")
         new = text.replace(find, replace) if all else text.replace(find, replace, 1)
-        self.write(rel, new, agent=agent, log=False)
+        r = self.write(rel, new, agent=agent, log=False, expect_mtime=expect_mtime)
         self.log(agent, "edited", rel)
-        return {"path": rel, "action": "edited", "replacements": n if all else 1}
+        return {"path": rel, "action": "edited", "replacements": n if all else 1, "changeset": r["changeset"], "mtime": r["mtime"]}
 
-    def write_section(self, path: str, heading: str, content: str, agent: str = "human", mode: str = "replace") -> dict:
+    def write_section(self, path: str, heading: str, content: str, agent: str = "human", mode: str = "replace",
+                      expect_mtime: float | None = None) -> dict:
         """Replace or append to the body of one heading; creates the heading if missing."""
         rel = self.find(path) or self.rel(self.resolve(path))
         p = self.resolve(rel)
         text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else f"# {Path(rel).stem}\n"
         want = heading.lstrip("#").strip()
-        matches = list(HEADING.finditer(text))
-        for i, m in enumerate(matches):
-            if m.group(2).strip().lower() == want.lower():
-                level = len(m.group(1))
-                end = len(text)
-                for nxt in matches[i + 1:]:
-                    if len(nxt.group(1)) <= level:
-                        end = nxt.start()
-                        break
-                body_start = m.end() + 1 if m.end() < len(text) and text[m.end()] == "\n" else m.end()
-                old_body = text[body_start:end].strip("\n")
-                new_body = content.strip("\n") if mode == "replace" else (old_body + "\n" + content.strip("\n")).strip("\n")
-                text = text[:body_start] + new_body + "\n\n" + text[end:].lstrip("\n")
-                break
-        else:
-            text = text.rstrip("\n") + f"\n\n## {want}\n{content.strip()}\n"
-        self.write(rel, text.rstrip("\n") + "\n", agent=agent, log=False)
+        text = section_text(text, want, content, mode)
+        r = self.write(rel, text, agent=agent, log=False, expect_mtime=expect_mtime)
         self.log(agent, "edited", rel, f"section: {want}")
-        return {"path": rel, "action": "edited", "section": want}
+        return {"path": rel, "action": "edited", "section": want, "changeset": r["changeset"], "mtime": r["mtime"]}
 
     def move(self, src: str, dst: str, agent: str = "human") -> dict:
         """Rename/move a note and rewrite every [[link]] that pointed to it."""
@@ -971,12 +1145,13 @@ class Brain:
         new_name = new_rel[:-3] if Path(new_rel).stem.lower() in {
             Path(r["path"]).stem.lower() for r in self.db.execute("SELECT path FROM notes") if r["path"] != old_rel
         } else Path(new_rel).stem  # use the full path only if the bare name would be ambiguous
-        with self._lock:
-            self._snapshot(old_p, agent)
+        with self.changeset(agent) as cs, self._lock:
+            before = self._snapshot(old_p, agent)
             new_p.parent.mkdir(parents=True, exist_ok=True)
             os.replace(old_p, new_p)
             self._drop(old_rel)
             self._index_one(new_p, new_p.stat())
+            self._record(new_rel, before, new_p, moved_from=old_rel)
             updated = []
             for ref in referrers:
                 rp = self.resolve(ref)
@@ -989,9 +1164,10 @@ class Brain:
 
                 new_text = WIKILINK_FULL.sub(swap, text)
                 if new_text != text:
-                    self._snapshot(rp, agent)
+                    vid = self._snapshot(rp, agent)
                     self._atomic_write(rp, new_text)
                     self._index_one(rp, rp.stat())
+                    self._record(ref, vid, rp)
                     updated.append(ref)
             self.db.commit()
         hist_old, hist_new = self._hist_dir(old_rel), self._hist_dir(new_rel)
@@ -1000,23 +1176,26 @@ class Brain:
             os.replace(hist_old, hist_new)
         self.log(agent, "moved", new_rel, f"from {old_rel}; fixed links in {len(updated)} note(s)")
         self.semantic.kick()
-        return {"path": new_rel, "from": old_rel, "action": "moved", "links_updated": updated}
+        return {"path": new_rel, "from": old_rel, "action": "moved", "links_updated": updated, "changeset": cs["id"]}
 
     def delete(self, path: str, agent: str = "human") -> dict:
         p = self.resolve(path)
         if not p.exists():
             raise FileNotFoundError(path)
-        self._snapshot(p, agent)
-        trash = self.root / ".trash"
-        trash.mkdir(exist_ok=True)
-        dest = trash / f"{int(time.time())}-{p.name}"
-        os.replace(p, dest)  # recoverable, like Obsidian's own .trash
         rel = self.rel(p)
-        with self._lock:
-            self._drop(rel)
-            self.db.commit()
+        self.check_agent_write(rel, agent)
+        with self.changeset(agent) as cs:
+            vid = self._snapshot(p, agent)
+            trash = self.root / ".trash"
+            trash.mkdir(exist_ok=True)
+            dest = trash / f"{int(time.time())}-{os.urandom(2).hex()}-{p.name}"
+            os.replace(p, dest)  # recoverable, like Obsidian's own .trash
+            with self._lock:
+                self._drop(rel)
+                self.db.commit()
+            self._record(rel, vid, None)
         self.log(agent, "deleted", rel)
-        return {"path": rel, "action": "deleted"}
+        return {"path": rel, "action": "deleted", "changeset": cs["id"]}
 
     def daily_path(self, day: date | None = None) -> str:
         return f"Daily/{(day or date.today()).isoformat()}.md"
@@ -1148,7 +1327,7 @@ class Brain:
         done = [a for a in acts if a["action"] == "completed task"]
         return {"days": days, "created": created, "changed": changed, "by_agent": by_agent,
                 "completed_tasks": [{"note": a["target"], "task": a.get("note", "")} for a in done],
-                "decisions_and_work": [a for a in acts if a.get("note") and a["action"] in ("did", "decided")],
+                "decisions_and_work": [a for a in acts if a.get("note") and a["action"] not in FILE_ACTIONS],
                 "open_tasks": self.tasks("open", limit=30)}
 
     # ── shared activity log (one logbook for every AI, on every device) ──
@@ -1185,14 +1364,19 @@ class Brain:
                 continue  # a half-synced last line from another device: skip it
         return out
 
-    def activity(self, limit: int = 50, agent: str | None = None) -> list[dict]:
+    def activity(self, limit: int = 50, agent: str | None = None, since: str | None = None) -> list[dict]:
         files = list(self.activity_dir.glob("*.jsonl")) if self.activity_dir.is_dir() else []
         legacy = self.meta_dir / "activity.jsonl"  # single-file log from v1.0-1.3
         if legacy.exists():
             files.append(legacy)
-        want = limit * (6 if agent else 2)
+        want = limit * (6 if agent or since else 2)
+        floor = _ts_key(since) if since else None
+        if since and not floor:
+            raise ValueError("since must be an ISO date or date-time")
         keyed = [(_ts_key(e["ts"]), i, e) for f in files for i, e in enumerate(self._tail(f, want))
-                 if isinstance(e, dict) and "ts" in e and (not agent or e.get("agent") == agent)]
+                 if isinstance(e, dict) and "ts" in e and (not agent or _actor_match(str(e.get("agent", "")), agent))]
+        if floor:
+            keyed = [k for k in keyed if k[0] > floor]
         keyed.sort(key=lambda x: (x[0], x[1]), reverse=True)  # real time (devices may differ in zone), then file order
         return [e for _, _, e in keyed[:limit]]
 
@@ -1267,3 +1451,36 @@ def extract_section(body: str, heading: str) -> str:
                     break
             return body[m.start():end].strip()
     raise KeyError(f"no section {heading!r}")
+
+
+def _file_sha(p: Path) -> str | None:
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()[:32]
+    except OSError:
+        return None
+
+
+def _actor_match(actor: str, want: str) -> bool:
+    """'core' matches core, core/forge, core/agent...; 'core/forge' matches only that."""
+    return actor == want or actor.startswith(want.rstrip("/") + "/")
+
+
+def section_text(text: str, want: str, content: str, mode: str = "replace") -> str:
+    """Pure: the note text with one heading's body replaced/appended (created if missing)."""
+    matches = list(HEADING.finditer(text))
+    for i, m in enumerate(matches):
+        if m.group(2).strip().lower() == want.lower():
+            level = len(m.group(1))
+            end = len(text)
+            for nxt in matches[i + 1:]:
+                if len(nxt.group(1)) <= level:
+                    end = nxt.start()
+                    break
+            body_start = m.end() + 1 if m.end() < len(text) and text[m.end()] == "\n" else m.end()
+            old_body = text[body_start:end].strip("\n")
+            new_body = content.strip("\n") if mode == "replace" else (old_body + "\n" + content.strip("\n")).strip("\n")
+            text = text[:body_start] + new_body + "\n\n" + text[end:].lstrip("\n")
+            break
+    else:
+        text = text.rstrip("\n") + f"\n\n## {want}\n{content.strip()}\n"
+    return text.rstrip("\n") + "\n"
