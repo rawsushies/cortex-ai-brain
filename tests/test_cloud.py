@@ -104,6 +104,16 @@ class ConflictTest(Tmp):
         self.assertFalse(any("Plan (1).md" in d for d in h["duplicates"]))  # reported once, as a conflict
         b.close()
 
+    def test_syncthing_conflict_copies(self):
+        v = self.t / "v"
+        b = Brain(v)
+        (v / "Projects").mkdir(parents=True, exist_ok=True)
+        for name in ("Projects/Tower.md", "Projects/Tower.sync-conflict-20261112-091500-ABCDEFG.md", "Ideas.sync-conflict-20261112-091500.md", "sync-conflict notes.md"):
+            (v / name).write_text(f"# {name}\nsome words in this note here")
+        c = {x["note"]: x["original"] for x in b.health()["sync_conflicts"]}
+        self.assertEqual(c, {"Projects/Tower.sync-conflict-20261112-091500-ABCDEFG.md": "Projects/Tower.md", "Ideas.sync-conflict-20261112-091500.md": None})
+        b.close()
+
 
 class BackupTest(Tmp):
     def make_vault(self):

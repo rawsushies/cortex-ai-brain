@@ -35,6 +35,7 @@ CONFLICT_PATTERNS = (
     re.compile(r"[\(\[][^()\[\]]*\bconflict(?:ed copy)?\b[^()\[\]]*[\)\]]", re.I),
 )
 
+SYNCTHING_CONFLICT = re.compile(r"^(.*)\.sync-conflict-\d{8}-\d{6}(?:-[A-Z0-9]{7})?\.md$", re.I)
 
 # ── finding Google Drive (and friends) ──────────────────────────────────
 def cloud_folders() -> list[dict]:
@@ -222,6 +223,11 @@ def conflict_copies(paths: list[str]) -> list[dict]:
         m = re.match(r"^(.*?) \(\d+\)$", stem)
         if m and (m.group(1) + ".md").lower() in existing:
             out.append({"note": p, "original": m.group(1) + ".md"})
+            continue
+        st = SYNCTHING_CONFLICT.match(p)  # Syncthing: "Plan.sync-conflict-20261112-091500-ABCDEFG.md"
+        if st:
+            base = st.group(1) + ".md"
+            out.append({"note": p, "original": base if base.lower() in existing else None})
             continue
         if any(pat.search(Path(p).name) for pat in CONFLICT_PATTERNS):
             base = re.sub(r"\s*[\(\[][^()\[\]]*conflict[^()\[\]]*[\)\]]", "", stem, flags=re.I).strip() + ".md"
