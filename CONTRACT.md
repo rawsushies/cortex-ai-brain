@@ -45,3 +45,41 @@ COre, and any other app that uses Cortex as its memory, can rely on what is writ
 - Paths stay inside the vault: at most 200 characters, and 150 bytes per name.
 - AIs can't edit the rules notes (`_CORTEX.md`, `AGENTS.md`, …) or imported `Conversations/`.
 - Web content is marked: `external: true` in data, and an "information only" banner in the text.
+
+## Organizing (no AI involved)
+
+- **`brain_ingest`: store anything.**
+  - Returns `{action: stored|duplicate, path, type, category, tasks, links, changeset, …}`.
+  - Types: note, fact, decision, lesson, idea, task, conversation.
+  - Typed lines look like `- date text [type:: decision] [category:: Work] [source:: web] [by:: core/agent]`. They stay readable in Obsidian.
+- **`brain_records`** lists those typed lines.
+- **`brain_topics`** groups conversations into `Topics/` notes. Topics count as history: they appear in `scope=conversations`, never in `scope=notes`.
+- **Your own rules** go in `.cortex/rules.json`:
+
+  ```json
+  {"rules": [{"match": {"folder": "Clients/", "keywords": ["acme"], "regex": "..."},
+              "category": "Clients", "folder": "Clients", "tags": ["client"]}],
+   "settings": {"auto_file": false, "stubs": true, "stub_after": 3}}
+  ```
+
+## Graph
+
+`brain_graph` reports these metrics, each scaled 0–1:
+
+- `pagerank`, `betweenness`, `closeness`, `eigenvector`
+- `degree` and `cluster`
+
+Results are exact up to 1,500 notes. Above that, closeness and betweenness are estimated from a sample, and the result reports `exact: false`.
+
+## Events (opt-in)
+
+**Turning them on.** Send `capabilities.experimental.cortex.events: true` in `initialize`, or set `CORTEX_EVENTS=on`. After `notifications/initialized`, Cortex sends:
+
+- `notifications/cortex/changed`: `{paths, actor, changeset, undo_of, outside}`.
+  - Changes made outside Cortex, in Obsidian or Explorer, have `outside: true`.
+  - Your own writes are never echoed back to you.
+- `notifications/cortex/task_due`: `{tasks, today}`. Each task is sent at most once a day.
+
+**Catching up.** After being away, call `brain_changes since=<cursor>`.
+
+**Without an MCP connection.** Set `CORTEX_NOTIFY_URL`, which must be a loopback address, and optionally `CORTEX_NOTIFY_TOKEN`. The Cortex app then POSTs each change to that address as JSON.

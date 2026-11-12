@@ -495,7 +495,7 @@ class Brain:
                 return {"skipped": True}
             started = time.monotonic()
             known = {r["path"]: (r["mtime"], r["size"]) for r in self.db.execute("SELECT path,mtime,size FROM notes")}
-            seen, changed = set(), 0
+            seen, changed, touched = set(), 0, []
             for p in self._walk():
                 try:
                     st = p.stat()
@@ -509,6 +509,8 @@ class Brain:
                     except OSError:
                         continue  # file vanished or is locked mid-sync; next sync retries
                     changed += 1
+                    if len(touched) < 200:
+                        touched.append(rel)
             removed = [r for r in known if r not in seen]
             for r in removed:
                 self._drop(r)
@@ -526,6 +528,9 @@ class Brain:
             self._sync_every = max(SYNC_INTERVAL, walk * 10)
         if changed or removed:
             self.semantic.kick()
+            if self.listeners and known:  # edits made outside Cortex (Obsidian, Explorer, another app)
+                self.emit({"type": "changed", "actor": "outside", "paths": touched + removed[:50],
+                           "removed": removed[:50]})
         return {"notes": len(seen), "changed": changed, "removed": len(removed)}
 
     # ── search ───────────────────────────────────────────────────────────
@@ -694,10 +699,14 @@ class Brain:
         seeds = self._search(query, 20, None, scope)
         if len(seeds) < 8:  # strict match found little: widen to any content word
             seeds += [h for h in self.keyword_search(query, 20, any_word=True, scope=scope) if h.path not in {x.path for x in seeds}]
+        from .graph import hub_boost
+        hubs = hub_boost(self) if seeds else {}
         for rank, h in enumerate(seeds):
             # Rank matters, but passage evidence decides: a short note whose section answers
-            # the question must beat a giant note that merely mentions every word.
-            weight[h.path] = max(weight.get(h.path, 0), 0.65 + 0.35 / (1 + 0.5 * rank))
+            # the question must beat a giant note that merely mentions every word. Hub notes
+            # (high PageRank) get a small nudge: what the vault links to most is usually relevant.
+            w = (0.65 + 0.35 / (1 + 0.5 * rank)) * (1 + 0.12 * hubs.get(h.path, 0.0))
+            weight[h.path] = max(weight.get(h.path, 0), w)
         frontier = [h.path for h in seeds[:6]]
         decay = 0.5
         for _ in range(max(0, min(hops, 2))):
@@ -1372,6 +1381,7 @@ class Brain:
         conflicts = conflict_copies(list(notes))
         conflict_paths = {c["note"] for c in conflicts}
         dupes = {d for d in dupes if not (set(d) & conflict_paths)}  # reported once, as a conflict
+        review = self._superseded_decisions()
         issues = len(broken) + len(dupes) + len(stale) + len(overdue) + len(empty) + 2 * len(conflicts)
         score = max(0, 100 - min(60, issues * 3) - min(20, len(orphans)))
         return {
@@ -1385,7 +1395,24 @@ class Brain:
             "empty": sorted(empty),
             "orphans": sorted(orphans),
             "too_long": big,
+            "decisions_to_review": review,
         }
+
+    def _superseded_decisions(self) -> list[dict]:
+        """Two decisions in the same note about the same thing, saying different things: the later
+        one probably replaced the earlier one. Worth a look (merge, or mark the old one superseded)."""
+        by_note: dict[str, list] = {}
+        for r in self.db.execute("SELECT path,line,day,text FROM records WHERE type='decision' ORDER BY path, day, line"):
+            by_note.setdefault(r["path"], []).append(r)
+        out = []
+        for path, rows in by_note.items():
+            sets = [(r, {w.lower() for w in content_words(r["text"]) if len(w) > 3}) for r in rows[-40:]]
+            for i, (a, wa) in enumerate(sets):
+                for b, wb in sets[i + 1:]:
+                    if wa and wb and a["text"] != b["text"] and len(wa & wb) / min(len(wa), len(wb)) >= 0.5:
+                        if "superseded" not in a["text"].lower():
+                            out.append({"note": path, "earlier": a["text"][:160], "later": b["text"][:160]})
+        return out[:25]
 
     # ── recap (raw material for daily/weekly reviews) ────────────────────
     def recap(self, days: int = 7) -> dict:

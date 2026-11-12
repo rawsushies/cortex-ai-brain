@@ -339,6 +339,9 @@ def run(vault: str, port: int = 7777, open_browser: bool = True, auto_import: bo
             webbrowser.open(url)
         brain.close()
         return
+    from .notify import attach
+    if attach(brain):
+        print("Changes are also sent to the local app at CORTEX_NOTIFY_URL.")
     print(f"Cortex is running at {url}")
     print(f"Vault: {brain.root}  ({info['notes']} notes indexed)")
     print("Press Ctrl+C to stop.")
