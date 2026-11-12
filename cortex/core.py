@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 5  # bump when the index layout changes; the index then rebuilds itself
+SCHEMA_VERSION = 6  # bump when the index layout changes; the index then rebuilds itself
 SKIP_DIRS = {".cortex", ".obsidian", ".git", ".trash", "node_modules", ".venv"}
 # Root-level files each AI host reads on its own; plumbing, not notes.
 POINTER_FILES = {"agents.md", "claude.md", "gemini.md"}
@@ -46,6 +46,7 @@ WIKILINK_FULL = re.compile(r"(!?)\[\[([^\]|#^]+)((?:[#^][^\]|]*)?)((?:\|[^\]]*)?
 TAG = re.compile(r"(?:^|\s)#([A-Za-z][\w/-]*)")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$", re.M)
 TASK = re.compile(r"^(\s*[-*+]\s+\[)([ xX])(\]\s+)(.*)$")
+FIELDS = re.compile(r"\[([\w-]+)::\s*([^\]]*)\]")
 DUE = re.compile(r"(?:📅\s*|due:\s*|@)(\d{4}-\d{2}-\d{2})")
 SYNC_INTERVAL = 2.0  # seconds between disk re-checks; grows with vault size (see sync)
 SNIPPET_CHARS = 170
@@ -62,8 +63,13 @@ ACTIVE_STATUSES = {"active", "in progress", "in-progress", "doing", "ongoing", "
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes(
   id INTEGER PRIMARY KEY, path TEXT UNIQUE, title TEXT, mtime REAL, size INTEGER,
-  tags TEXT, words INTEGER, status TEXT, created REAL
+  tags TEXT, words INTEGER, status TEXT, created REAL, category TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS records(path TEXT, line INTEGER, type TEXT, category TEXT, source TEXT, by TEXT,
+  day TEXT, text TEXT);
+CREATE INDEX IF NOT EXISTS records_path ON records(path);
+CREATE INDEX IF NOT EXISTS records_type ON records(type);
+CREATE INDEX IF NOT EXISTS notes_category ON notes(category);
 CREATE TABLE IF NOT EXISTS links(src TEXT, dst TEXT, dst_l TEXT);
 CREATE INDEX IF NOT EXISTS links_src ON links(src);
 CREATE INDEX IF NOT EXISTS links_dst_l ON links(dst_l);
@@ -211,6 +217,7 @@ class Brain:
         self._names: dict[str, str] | None = None
         self._text_cache: dict[str, tuple[float, str]] = {}
         self._recall_cache: dict[tuple, dict] = {}
+        self._rules: tuple[float, list] = (-1.0, [])
         self._norms: dict[str, tuple[str, str]] | None = None  # path -> normalized (stem, title), for the duplicate guard
         self._gen = 0  # bumped on every index change: cheap cache key for recall
         self._cs_local = threading.local()
@@ -221,7 +228,7 @@ class Brain:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         if self.db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-            for t in ("notes", "links", "tasks", "fts", "emb"):
+            for t in ("notes", "links", "tasks", "fts", "emb", "records"):
                 self.db.execute(f"DROP TABLE IF EXISTS {t}")
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.executescript(SCHEMA)
@@ -344,7 +351,7 @@ class Brain:
         links = {m.strip() for m in WIKILINK.findall(no_code)}  # [[examples]] in code aren't links
         status = str(meta.get("status") or "").strip().lower()
         # Line numbers are counted in the full text so toggling edits the right line.
-        tasks, in_code = [], False
+        tasks, records, in_code = [], [], False
         for i, line in enumerate(text.splitlines()):
             if line.lstrip().startswith("```"):
                 in_code = not in_code
@@ -352,27 +359,92 @@ class Brain:
             if m:
                 due = DUE.search(m.group(4))
                 tasks.append((rel, i, m.group(4).strip(), int(m.group(2) != " "), due.group(1) if due else None))
+            if not in_code and "::" in line:
+                f = dict((k.lower(), v.strip()) for k, v in FIELDS.findall(line))
+                if f.get("type"):
+                    day = re.search(r"\d{4}-\d{2}-\d{2}", line) or re.search(r"\d{4}-\d{2}-\d{2}", rel)
+                    clean = FIELDS.sub("", re.sub(r"^\s*[-*+]\s+", "", line)).strip()
+                    records.append((rel, i, f["type"][:20], f.get("category", "")[:40], f.get("source", "")[:24],
+                                    f.get("by", "")[:48], day.group(0) if day else "", clean[:500]))
+        category = str(meta.get("category") or "").strip()[:40] if not isinstance(meta.get("category"), list) else ""
+        if not category:
+            category = self._infer_category(rel, title, body)
         db = self.db
-        vals = (title, st.st_mtime, st.st_size, " ".join(tags), len(body.split()), status)
+        vals = (title, st.st_mtime, st.st_size, " ".join(tags), len(body.split()), status, category)
         row = db.execute("SELECT id FROM notes WHERE path=?", (rel,)).fetchone()
         if row:  # the FTS row shares the note's id, so updates are O(1), not a table scan
             nid = row[0]
-            db.execute("UPDATE notes SET title=?,mtime=?,size=?,tags=?,words=?,status=? WHERE id=?", (*vals, nid))
+            db.execute("UPDATE notes SET title=?,mtime=?,size=?,tags=?,words=?,status=?,category=? WHERE id=?", (*vals, nid))
             db.execute("DELETE FROM fts WHERE rowid=?", (nid,))
             db.execute("DELETE FROM links WHERE src=?", (rel,))
             db.execute("DELETE FROM tasks WHERE path=?", (rel,))
+            db.execute("DELETE FROM records WHERE path=?", (rel,))
         else:
             created = getattr(st, "st_birthtime", None) or min(st.st_mtime, st.st_ctime)
             nid = db.execute(
-                "INSERT INTO notes(path,title,mtime,size,tags,words,status,created) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO notes(path,title,mtime,size,tags,words,status,category,created) VALUES(?,?,?,?,?,?,?,?,?)",
                 (rel, *vals, created)).lastrowid
         db.execute("INSERT INTO fts(rowid,title,tags,body) VALUES(?,?,?,?)", (nid, title, " ".join(tags), body))
         db.executemany("INSERT INTO links(src,dst,dst_l) VALUES(?,?,?)", [(rel, l, l.lower()) for l in links])
         db.executemany("INSERT INTO tasks(path,line,text,done,due) VALUES(?,?,?,?,?)", tasks)
+        db.executemany("INSERT INTO records(path,line,type,category,source,by,day,text) VALUES(?,?,?,?,?,?,?,?)", records)
         self._names_add(rel, title)
         if self._norms is not None:
             self._norms[rel] = (norm_title(rel.rsplit("/", 1)[-1][:-3]), norm_title(title))
         self._gen += 1
+
+    # ── organizing settings (.cortex/rules.json, synced with the vault) ────
+    def rules(self) -> list[dict]:
+        f = self.meta_dir / "rules.json"
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            mt = 0.0
+        if mt != self._rules[0]:
+            from .organize import load_rules
+            self._rules = (mt, load_rules(self.root))
+        return self._rules[1]
+
+    def organize_config(self) -> dict:
+        try:
+            data = json.loads((self.meta_dir / "rules.json").read_text(encoding="utf-8"))
+            cfg = data.get("settings", {}) if isinstance(data, dict) else {}
+            return cfg if isinstance(cfg, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _infer_category(self, rel: str, title: str, body: str) -> str:
+        """Category for the index only (the file is not touched): your rules, then keywords."""
+        from .organize import lexicon_category, rule_category
+        if rel.startswith("Daily/"):
+            return ""
+        r = rule_category(self.rules(), rel, title, body)
+        if r and r.get("category"):
+            return str(r["category"])[:40]
+        return lexicon_category(title, body)[0] or ""
+
+    def records(self, type: str | None = None, category: str | None = None, source: str | None = None,
+                query: str | None = None, limit: int = 50) -> list[dict]:
+        """Typed lines ([type:: decision] ...) across the vault, newest first."""
+        self.sync()
+        sql, args = "SELECT path,line,type,category,source,by,day,text FROM records WHERE 1", []
+        for col, val in (("type", type), ("category", category), ("source", source)):
+            if val:
+                sql += f" AND lower({col})=?"
+                args.append(val.lower())
+        if query:
+            for w in content_words(query)[:6]:
+                sql += " AND text LIKE ?"
+                args.append(f"%{w}%")
+        sql += " ORDER BY day DESC, path, line LIMIT ?"
+        args.append(max(1, min(int(limit), 500)))
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    def categories(self) -> list[dict]:
+        self.sync()
+        return [{"category": r[0], "count": r[1]} for r in self.db.execute(
+            "SELECT category, count(*) FROM notes WHERE category != '' AND path NOT LIKE 'Conversations/%' "
+            "GROUP BY category ORDER BY count(*) DESC")]
 
     def _names_add(self, rel: str, title: str) -> None:
         """Keep the link-name map current without rebuilding it (rebuilds cost ~0.3s at 100k notes)."""
@@ -394,6 +466,7 @@ class Brain:
             self.semantic.drop(row[0])
         self.db.execute("DELETE FROM links WHERE src=?", (rel,))
         self.db.execute("DELETE FROM tasks WHERE path=?", (rel,))
+        self.db.execute("DELETE FROM records WHERE path=?", (rel,))
         self._names = None
         if self._norms is not None:
             self._norms.pop(rel, None)
@@ -476,10 +549,11 @@ class Brain:
 
     @staticmethod
     def _scope_sql(scope: str) -> str:
+        # Topics/ notes are summaries of imported chats: they belong with the conversations.
         if scope == "notes":
-            return " AND n.path NOT LIKE 'Conversations/%'"
+            return " AND n.path NOT LIKE 'Conversations/%' AND n.path NOT LIKE 'Topics/%'"
         if scope == "conversations":
-            return " AND n.path LIKE 'Conversations/%'"
+            return " AND (n.path LIKE 'Conversations/%' OR n.path LIKE 'Topics/%')"
         return ""
 
     def keyword_search(self, q: str, limit: int = 10, tag: str | None = None, any_word: bool = False,
@@ -525,7 +599,7 @@ class Brain:
             kw = self.keyword_search(q, max(limit, 20), tag, any_word=True, scope=scope)
         sem = self.semantic.search(q, max(limit, 20)) if q.strip() and scope != "conversations" else []
         if sem and scope == "notes":
-            sem = [h for h in sem if not h.path.startswith("Conversations/")]
+            sem = [h for h in sem if not h.path.startswith(("Conversations/", "Topics/"))]
         if tag and sem:
             tagged = {h.path for h in self.keyword_search("", 10000, tag)}
             sem = [h for h in sem if h.path in tagged]
@@ -631,7 +705,7 @@ class Brain:
             for src in frontier:
                 neighbours = self.backlinks(src) + [l["path"] for l in self.outlinks(src) if l["path"]]
                 for nb in neighbours[:25]:
-                    if scope == "notes" and nb.startswith("Conversations/"):
+                    if scope == "notes" and nb.startswith(("Conversations/", "Topics/")):
                         continue
                     w = weight[src] * decay
                     if w > weight.get(nb, 0):
@@ -670,7 +744,7 @@ class Brain:
                     continue
                 passages.append({"path": path, "title": title, "heading": heading, "text": chunk, "score": score,
                                  "pos": pos, "opens": opens_section, "via": via.get(path),
-                                 "external": str(meta.get("trust", "")).lower() == "external"})
+                                 "external": str(meta.get("trust", "")).lower() == "external" or "[source:: web]" in chunk})
         passages.sort(key=lambda p: -p["score"])
         chosen, used, per_note, seen = [], 0, {}, set()
         for p in passages:

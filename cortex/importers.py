@@ -543,7 +543,15 @@ class Importer:
                 self.brain.log("cortex", "imported", "Conversations/",
                                f"{new} new, {updated} updated conversation(s): "
                                + ", ".join(f"{k} {v}" for k, v in counts.items()))
-            return {"new": new, "updated": updated, "by_source": counts, "last_run": state["last_run"]}
+            topics = None
+            if new or updated:
+                try:  # group the new chats into Topics/ while we're here (incremental, bounded)
+                    from .organize import Organizer
+                    topics = Organizer(self.brain).group_conversations(agent="cortex")
+                except Exception as e:
+                    print(f"cortex import: topic grouping skipped: {e}", file=sys.stderr)
+            return {"new": new, "updated": updated, "by_source": counts, "last_run": state["last_run"],
+                    "topics": topics}
         finally:
             try:
                 self.lock_file.unlink()
