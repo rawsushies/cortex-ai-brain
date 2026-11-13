@@ -2,6 +2,38 @@
 
 **One second brain shared by all your AIs.** Claude Code, Codex, Gemini CLI, Cursor and Claude Desktop all read and write the same notes, and you get an app to see and edit everything they remember.
 
+## New in 2.0: the brain organizes itself
+
+![Cortex graph view with analysis panel](screenshot.png)
+
+- **Tell it anything.** Type into "Tell Cortex anything…", or have COre/any AI call `brain_ingest`. Cortex then:
+  - works out what it is: a task, decision, lesson, idea or note
+  - picks a category (your rules first, then keyword lists in English and Malay)
+  - pulls out tasks with due dates, such as "remind me to call the bank tomorrow" or "jangan lupa bayar bil esok"
+  - links the notes it mentions and files it in the right place
+  - skips it if it's already stored
+
+  No AI is involved. It's rules and text statistics, so it's fast and predictable.
+- **Undo anything, as one unit.** Every change gets a change-set id. Undo it from the Changes view, with `Ctrl+Z`, from the toast, or with `brain_undo`. An undo can itself be undone.
+- **Conversations grouped into topics.** Imported or ingested chats become `Topics/` notes. Each has a summary, the decisions and action items found in the chats, and links to every chat.
+- **Graph analysis.** The graph sizes notes by PageRank, betweenness, closeness or eigenvector, colours them by cluster, category or folder, and shows missing link targets in red. A ranking panel and a brain analysis panel sit beside it.
+- **Built for COre.**
+  - Every tool returns structured data.
+  - There's a versioned contract (`CONTRACT.md`).
+  - Writes can carry a per-helper identity (`core/forge`).
+  - Batches can be atomic or dry-run.
+  - Opt-in push events tell COre about changes, edits made in Obsidian, and tasks coming due.
+- **Captures your AI sessions as they happen.** The memory gateway turns conversations from any provider into one event format. It stores them append-only in `Conversations/`, without duplicates across devices and with credentials redacted, through a retrying queue.
+  - **Claude Code, near real time:** add the hook below to `~/.claude/settings.json`. Cortex never edits it for you.
+
+    ```json
+    {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "cortex gateway hook claude-code"}]}]}}
+    ```
+
+  - **Status:** `cortex gateway status`.
+  - **What each provider really supports:** `cortex gateway capabilities`. ChatGPT and Claude.ai web only offer export files.
+- **Fast.** On a 10,000-note vault: search about 6 ms, recall about 10 ms, append under 1 ms. Run `python scripts/bench.py` to check.
+
 - **Your notes stay yours.** Everything is plain Markdown in a folder, so it opens in Obsidian too.
 - **One brain for every AI.** A single MCP server connects every AI app. One AI saves a decision and the next one already knows it.
 - **A shared logbook.** You can see which AI changed what, and when.

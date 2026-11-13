@@ -35,7 +35,11 @@ a = Analysis(
     pathex=[str(ROOT)],
     datas=[(str(ROOT / "cortex" / "ui"), "cortex/ui")],
     hiddenimports=["cortex.web", "cortex.mcp_server", "cortex.semantic", "cortex.importers",
-                   "cortex.research", "cortex.cloud"],
+                   "cortex.research", "cortex.cloud", "cortex.archive", "cortex.organize", "cortex.dates",
+                   "cortex.graph", "cortex.notify", "cortex_gateway", "cortex_gateway.cli", "cortex_gateway.queue",
+                   "cortex_gateway.schema", "cortex_gateway.adapters", "cortex_gateway.adapters.claude_code",
+                   "cortex_gateway.adapters.file_drop", "cortex_gateway.adapters.local_apps",
+                   "cortex_gateway.adapters.exports", "cortex_gateway.adapters.base", "cortex_gateway.rules"],
     excludes=["tkinter", "unittest", "pydoc", "test", "lib2to3", "idlelib"],
     noarchive=False,
 )

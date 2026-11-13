@@ -304,6 +304,15 @@ def cmd_cloud(args) -> None:
     vault = vault_path(args.vault)
     cfg = load_config()
     prov = cloud.provider_for(vault)
+    st = next((s for s in cloud.sync_providers(vault) if s["provider"] == "Syncthing"), None)
+    if st and not prov:
+        print(f"This brain already syncs with Syncthing ({st['path']}).\n"
+              "Don't also put it in a cloud drive: two sync tools on one folder copy each other's half-written\n"
+              "files and multiply conflicts. Keep Syncthing (recommended), or remove it before moving to a cloud drive.")
+        return
+    if not prov:
+        print("Tip: Syncthing (free, device to device, no cloud account) is the recommended way to share a brain\n"
+              "between your computers; COre can set it up. This command moves the brain into a cloud drive instead.\n")
     print(f"Your brain: {vault}")
     print(f"This device: {__import__('cortex.core', fromlist=['DEVICE']).DEVICE}\n")
     if prov:
@@ -404,6 +413,20 @@ def main(argv=None) -> None:
             s.add_argument("--agent", help="name shown in the logbook")
         if name == "connect":
             s.add_argument("--all", action="store_true", help="also write configs for apps not detected")
+    g = sub.add_parser("gateway", help="capture conversations from AI providers (scan, hook, drop, status, retry)")
+    g.add_argument("action", choices=["scan", "hook", "drop", "status", "retry", "capabilities", "import", "forget",
+                                      "retain", "token"])
+    g.add_argument("provider", nargs="?", help="e.g. claude-code")
+    g.add_argument("--provider", dest="provider_opt")
+    g.add_argument("--dead", action="store_true", help="with retry: also retry dead letters")
+    g.add_argument("--session", help="with forget: one conversation (its session id)")
+    g.add_argument("--before", help="with forget: everything started before this date (YYYY-MM-DD)")
+    g.add_argument("--dry-run", action="store_true", help="with forget: show what would be deleted")
+    g.add_argument("--new", action="store_true", help="with token: make a new token (the old one stops working)")
+    g.add_argument("--vault")
+    cv = sub.add_parser("config", help="show or set settings (e.g. `cortex config vault`)")
+    cv.add_argument("key", choices=["vault"])
+    cv.add_argument("value", nargs="?")
     r = sub.add_parser("restore", help="restore a backup into a new folder")
     r.add_argument("zip")
     r.add_argument("target")
@@ -419,15 +442,40 @@ def main(argv=None) -> None:
         return cmd_restore(args)
     if cmd == "connect":
         return cmd_connect(args)
+    if cmd == "config":
+        cfg = load_config()
+        if args.value:
+            v = Path(args.value).expanduser().resolve()
+            cfg["vault"] = str(v)
+            save_config(cfg)
+        print(cfg.get("vault") or str(vault_path(None)))
+        return
     if cmd == "app" and not (getattr(args, "vault", None) or os.environ.get("CORTEX_VAULT") or load_config().get("vault")):
         # First launch (e.g. double-clicking Cortex.exe): create the brain in Documents\Cortex.
         cmd_init(argparse.Namespace(vault=None))
+    if cmd == "gateway" and args.action in ("capabilities", "token"):  # need no vault
+        from cortex_gateway.cli import run as gw_run
+        print(json.dumps(gw_run(None, args.action, new=args.new), indent=2))
+        return
     vault = vault_path(getattr(args, "vault", None))
-    if cmd != "mcp":
+    if cmd not in ("mcp", "gateway"):
         upgrade_rules(vault)
     if cmd == "mcp":
         from .mcp_server import run
         return run(str(vault), getattr(args, "agent", None))
+    if cmd == "gateway":
+        from cortex_gateway.cli import run as gw_run
+        try:
+            prov = args.provider_opt or args.provider
+            r = gw_run(vault, args.action, None if args.action == "import" else prov, args.dead, session=args.session,
+                       before=args.before, dry_run=args.dry_run, file=prov if args.action == "import" else None, new=args.new)
+        except Exception as e:
+            if args.action != "hook":
+                raise
+            print(f"cortex gateway hook: {e}", file=sys.stderr)  # a hook must never fail the AI app
+            return
+        print(json.dumps(r, indent=2, ensure_ascii=False, default=str))
+        return
     if cmd == "import":
         from .core import Brain
         from .importers import Importer

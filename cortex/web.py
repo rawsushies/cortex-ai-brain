@@ -17,6 +17,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .core import Brain, ConflictError
 from .importers import Importer
+# Loaded once, up front: these modules import each other lazily, and two request threads importing
+# them at the same moment can deadlock Python's per-module import locks.
+from . import archive as _archive, organize as _organize, graph as _graph_mod  # noqa: F401,E402
+import cortex_gateway  # noqa: F401,E402
+from cortex_gateway import adapters as _gw_adapters, cli as _gw_cli, rules as _gw_rules, schema as _gw_schema  # noqa: F401,E402
 from .research import FetchError
 
 UI_DIR = Path(__file__).parent / "ui"
@@ -26,7 +31,7 @@ MAX_BODY = 25_000_000
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".woff2": "font/woff2"}
 
 
 def make_handler(brain: Brain):
@@ -135,6 +140,20 @@ def make_handler(brain: Brain):
                 "/api/setup": lambda: {"import_history": _cfg().get("import_history"),
                                        "connected": bool(_cfg().get("connected_at")),
                                        "detected": Importer(brain).status()["detected"]},
+                "/api/graph2": lambda: _graph().view(brain, q.get("focus") or None, _int(q.get("depth"), 1, lo=1, hi=3),
+                                                     q.get("metric") or "pagerank", _int(q.get("limit"), 1500, lo=1, hi=5000),
+                                                     conversations=q.get("conversations") == "1"),
+                "/api/categories": lambda: brain.categories(),
+                "/api/notes_meta": lambda: [dict(r) for r in brain.db.execute(
+                    "SELECT path, title, category, tags, mtime FROM notes ORDER BY lower(path)")],
+                "/api/changes": lambda: brain.changesets(_int(q.get("limit"), 100, lo=1, hi=1000), q.get("actor") or None),
+                "/api/records": lambda: brain.records(q.get("type") or None, q.get("category") or None, q.get("source") or None,
+                                                      q.get("q") or None, _int(q.get("limit"), 100, lo=1, hi=500)),
+                "/api/topics": lambda: _topics(brain),
+                "/api/rules": lambda: _rules_get(brain),
+                "/api/capture-rules": lambda: _gwrules().load(brain.root),
+                "/api/gateway": lambda: _gateway_status(brain),
+                "/api/review": lambda: _organize.Organizer(brain).review_items(),
                 "/api/conversations": lambda: brain.recent(_int(q.get("limit"), 200), conversations="only") if not q.get("q")
                     else [h.__dict__ for h in brain.search(q["q"], _int(q.get("limit"), 50), scope="conversations")],
             }
@@ -148,9 +167,13 @@ def make_handler(brain: Brain):
 
         # ── POST / DELETE ────────────────────────────────────────────────
         def do_POST(self) -> None:
-            if not self._allowed() or not self._guard():
+            if not self._allowed():
                 return
             u = urlparse(self.path)
+            if u.path == "/api/events":  # local apps and webhooks: bearer token instead of the browser header
+                return self._route(self._events)
+            if not self._guard():
+                return
 
             def go():
                 b = self._body()
@@ -222,12 +245,61 @@ def make_handler(brain: Brain):
                                                R.results_markdown(b["query"], b["data"]), agent="you"))
                 elif u.path == "/api/capture":
                     self._json(brain.capture(b["text"], agent="you"))
+                elif u.path == "/api/ingest":
+                    from .organize import Organizer
+                    if not isinstance(b.get("text"), str):
+                        raise ValueError("text must be a string")
+                    self._json(Organizer(brain).ingest(b["text"], agent="you", kind=b.get("type") or None,
+                                                       title=b.get("title") or None, project=b.get("project") or None))
+                elif u.path == "/api/undo":
+                    self._json(brain.undo(b.get("changeset") or None, agent="you"))
+                elif u.path == "/api/topics/refresh":
+                    from .organize import Organizer
+                    Organizer(brain).group_conversations(agent="cortex")
+                    self._json(_topics(brain))
+                elif u.path == "/api/rules":
+                    self._json(_rules_put(brain, b))
+                elif u.path == "/api/review":
+                    self._json(_organize.Organizer(brain).verify(b["path"], b.get("text") or None, b.get("action") or "accept", agent="you"))
+                elif u.path == "/api/capture-rules":
+                    self._json(_gwrules().save(brain.root, b))
+                elif u.path == "/api/forget":
+                    from .archive import forget
+                    if not b.get("confirm") and not b.get("dry_run"):
+                        raise ValueError("forgetting deletes for good: send confirm=true (or dry_run=true to preview)")
+                    self._json(forget(brain, b.get("provider") or None, b.get("session") or None, b.get("before") or None,
+                                      agent="you", dry_run=bool(b.get("dry_run"))))
                 elif u.path == "/api/reindex":
                     self._json(brain.sync(force=True))
                 else:
                     self._json({"error": "not found"}, 404)
 
             self._route(go)
+
+        def _events(self) -> None:
+            import hmac
+            from .cli import load_config
+            want = load_config().get("gateway_token")
+            got = (self.headers.get("Authorization") or "")
+            if not want:
+                return self._json({"error": "REST intake is off: run `cortex gateway token` to turn it on"}, 403)
+            if not (got.startswith("Bearer ") and hmac.compare_digest(got[7:].strip().encode(), want.encode())):
+                return self._json({"error": "missing or wrong token"}, 401)
+            b = self._body()
+            events = b.get("events") if isinstance(b.get("events"), list) else [b] if b.get("provider") else None
+            if not events:
+                raise ValueError("send {events: [...]} or a single event object")
+            from cortex_gateway import Gateway
+            gw = Gateway(brain, agent="rest")
+            try:
+                for e in events:
+                    if isinstance(e, dict):
+                        e.setdefault("capture", "rest")
+                res = gw.ingest_now(events)
+            finally:
+                gw.close()
+            self._json({"results": res, **{k: sum(1 for r in res if r["status"] == k)
+                                           for k in ("archived", "duplicate", "invalid", "skipped", "queued")}})
 
         def do_DELETE(self) -> None:
             if not self._allowed() or not self._guard():
@@ -253,6 +325,83 @@ def _int(v, default: int, lo: int = 0, hi: int = 100_000) -> int:
     return max(lo, min(n, hi))
 
 
+def _gwrules():
+    from cortex_gateway import rules
+    return rules
+
+
+def _gateway_status(brain: Brain) -> dict:
+    from cortex_gateway import Gateway
+    from cortex_gateway.adapters import capabilities
+    from .cli import load_config
+    gw = Gateway(brain)
+    try:
+        return {"queue": gw.queue.status(), "adapters": capabilities(), "rest_enabled": bool(load_config().get("gateway_token"))}
+    finally:
+        gw.close()
+
+
+def _graph():
+    from . import graph
+    return graph
+
+
+def _topics(brain: Brain) -> list[dict]:
+    from .importers import _safe
+    from .organize import Organizer
+    data = Organizer(brain).load_topics()
+    rows = [{"id": tid, "name": t["name"], "terms": list(t["terms"])[:8], "conversations": len(t["members"]),
+             "note": f"Topics/{_safe(t['name'], 60)}.md", "latest": max(t["members"]) if t["members"] else ""}
+            for tid, t in data["topics"].items() if t["members"]]
+    return sorted(rows, key=lambda r: (-r["conversations"], r["name"]))
+
+
+def _rules_get(brain: Brain) -> dict:
+    f = brain.meta_dir / "rules.json"
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {"rules": data if isinstance(data, list) else []}
+    data.setdefault("rules", [])
+    data.setdefault("settings", {"auto_file": False, "stubs": True, "stub_after": 3})
+    return data
+
+
+def _rules_put(brain: Brain, body: dict) -> dict:
+    """Validate and save .cortex/rules.json (written atomically; synced with the vault)."""
+    rules = body.get("rules", [])
+    settings = body.get("settings", {})
+    if not isinstance(rules, list) or not isinstance(settings, dict) or len(rules) > 500:
+        raise ValueError("rules must be a list (at most 500) and settings an object")
+    import re as _re
+    clean = []
+    for r in rules:
+        if not isinstance(r, dict) or not isinstance(r.get("match"), dict) or not str(r.get("category") or "").strip():
+            raise ValueError("each rule needs a match {folder, keywords, regex} and a category")
+        m = r["match"]
+        if m.get("regex"):
+            try:
+                _re.compile(str(m["regex"])[:300])
+            except _re.error as e:
+                raise ValueError(f"bad regex in rule for {r['category']}: {e}")
+        kws = m.get("keywords") or []
+        clean.append({"match": {k: v for k, v in {"folder": str(m.get("folder") or "")[:120],
+                                                    "keywords": [str(k)[:60] for k in (kws if isinstance(kws, list) else [kws])][:30],
+                                                    "regex": str(m.get("regex") or "")[:300]}.items() if v},
+                      "category": str(r["category"]).strip()[:40],
+                      **({"folder": str(r["folder"])[:120]} if r.get("folder") else {}),
+                      **({"tags": [str(t)[:40] for t in r["tags"]][:10]} if isinstance(r.get("tags"), list) else {})})
+    out = {"rules": clean, "settings": {"auto_file": bool(settings.get("auto_file")), "stubs": settings.get("stubs") is not False,
+                                        "stub_after": max(2, min(int(settings.get("stub_after") or 3), 20))}}
+    f = brain.meta_dir / "rules.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, f)
+    return out
+
+
 def _cfg() -> dict:
     from .cli import load_config
     return load_config()
@@ -267,6 +416,13 @@ def _auto_backup(brain: Brain, stop: threading.Event) -> None:
     """One verified snapshot a day (if a backup folder is set), checked hourly."""
     stop.wait(60)  # let the app settle first
     while not stop.is_set():
+        try:
+            from cortex_gateway.cli import retain  # conversations past their provider's retention: forgotten daily
+            r = retain(brain)
+            if any(r["forgot"].values()):
+                print(f"Retention: forgot {sum(r['forgot'].values())} old conversation(s)")
+        except Exception as e:
+            print(f"Retention skipped: {e}")
         try:
             cfg = _cfg()
             if _cloud().backup_due(cfg):
@@ -339,6 +495,9 @@ def run(vault: str, port: int = 7777, open_browser: bool = True, auto_import: bo
             webbrowser.open(url)
         brain.close()
         return
+    from .notify import attach
+    if attach(brain):
+        print("Changes are also sent to the local app at CORTEX_NOTIFY_URL.")
     print(f"Cortex is running at {url}")
     print(f"Vault: {brain.root}  ({info['notes']} notes indexed)")
     print("Press Ctrl+C to stop.")

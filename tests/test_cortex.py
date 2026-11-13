@@ -121,7 +121,7 @@ class McpTest(unittest.TestCase):
             self.assertEqual(len(r), 7)  # notification got no reply
             self.assertEqual(r[0]["result"]["protocolVersion"], "2025-06-18")
             self.assertEqual(s.agent, "claude")
-            self.assertEqual(len(r[1]["result"]["tools"]), 16)
+            self.assertEqual(len(r[1]["result"]["tools"]), 28)
             self.assertIn("created Notes/A.md", r[2]["result"]["content"][0]["text"])
             self.assertIn("Notes/A.md", r[3]["result"]["content"][0]["text"])
             self.assertTrue(r[4]["result"]["isError"])

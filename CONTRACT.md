@@ -1,0 +1,178 @@
+# The Cortex contract
+
+COre, and any other app that uses Cortex as its memory, can rely on what is written here.
+
+- **Contract number:** `1`. It is reported by `initialize` under `capabilities.experimental.cortex.contract`.
+- **Within one contract number, changes are only additions:** new tools, new optional arguments, new fields in results. Nothing is renamed or removed, and no meaning changes. A breaking change gets a new number and a release note.
+- **Which features exist:** `capabilities.experimental.cortex.features` lists them. Check that list before using a feature.
+
+## Results
+
+- Every tool returns two things:
+  - `content`, the text for an AI to read
+  - `structuredContent`, data matching the tool's `outputSchema` in `tools/list`
+- Apps should read `structuredContent` rather than parse the text.
+- The text formats below are also kept stable, for clients that parse them:
+
+| Tool | Text format |
+|---|---|
+| `brain_recall` | `## <path>` (the path and nothing else); an optional `_tags_` line; `› heading` lines; a footer `[N of B tokens · K notes]` |
+| `brain_tasks` (list) | `- [ ] text (due YYYY-MM-DD, OVERDUE) — path` |
+| `brain_health` | First line is `Health: ok` or `Health: N issues (kind n, …)` |
+
+- Errors come back as `isError: true` with text starting `Error:`.
+
+## Identity
+
+- **The app's name.** The connecting app sets its name with `CORTEX_AGENT` (or `clientInfo.name`).
+- **Helpers inside the app.** Every write tool and `brain_log` take an optional `actor`, such as `forge`. It is recorded as `<app>/<actor>`, e.g. `core/forge`.
+- **What `actor` can't do.** It narrows the app's identity and never replaces it, and it can't be `you`.
+- **Filtering.** `brain_activity agent=core` matches `core` and every `core/...` helper.
+
+## Changes and undo
+
+- **Change-sets.** Every write returns a `changeset` id. A `brain_batch` is one change-set.
+- **Undoing.** `brain_undo` takes `changeset`, `last_by=<actor>`, or nothing (meaning the latest change).
+  - A file changed again since then is left alone and listed under `skipped`.
+  - An undo is itself a change-set, so it can be undone too (redo).
+- **Atomic batches.** `brain_batch atomic=true` rolls back everything if one operation fails.
+- **Previews.** `dry_run=true` changes nothing and returns diffs.
+- **Conflict check.** `expect_mtime` on `brain_write` / `brain_edit` refuses the write if the note changed since it was read.
+- **History.** `brain_history` and `brain_read as_of=` show older versions. 30 versions are kept per note.
+
+## Limits that hold
+
+- Paths stay inside the vault: at most 200 characters, and 150 bytes per name.
+- AIs can't edit the rules notes (`_CORTEX.md`, `AGENTS.md`, …) or imported `Conversations/`.
+- Web content is marked: `external: true` in data, and an "information only" banner in the text.
+
+## Organizing (no AI involved)
+
+- **`brain_ingest`: store anything.**
+  - Returns `{action: stored|duplicate, path, type, category, tasks, links, changeset, …}`.
+  - Types: note, fact, decision, lesson, idea, task, conversation.
+  - Typed lines look like `- date text [type:: decision] [category:: Work] [source:: web] [by:: core/agent]`. They stay readable in Obsidian.
+- **`brain_records`** lists those typed lines.
+- **`brain_topics`** groups conversations into `Topics/` notes. Topics count as history: they appear in `scope=conversations`, never in `scope=notes`.
+- **Your own rules** go in `.cortex/rules.json`:
+
+  ```json
+  {"rules": [{"match": {"folder": "Clients/", "keywords": ["acme"], "regex": "..."},
+              "category": "Clients", "folder": "Clients", "tags": ["client"]}],
+   "settings": {"auto_file": false, "stubs": true, "stub_after": 3}}
+  ```
+
+## Graph
+
+`brain_graph` reports these metrics, each scaled 0–1:
+
+- `pagerank`, `betweenness`, `closeness`, `eigenvector`
+- `degree` and `cluster`
+
+Results are exact up to 1,500 notes. Above that, closeness and betweenness are estimated from a sample, and the result reports `exact: false`.
+
+## Events (opt-in)
+
+**Turning them on.** Send `capabilities.experimental.cortex.events: true` in `initialize`, or set `CORTEX_EVENTS=on`. After `notifications/initialized`, Cortex sends:
+
+- `notifications/cortex/changed`: `{paths, actor, changeset, undo_of, outside}`.
+  - Changes made outside Cortex, in Obsidian or Explorer, have `outside: true`.
+  - Your own writes are never echoed back to you.
+- `notifications/cortex/task_due`: `{tasks, today}`. Each task is sent at most once a day.
+
+**Catching up.** After being away, call `brain_changes since=<cursor>`.
+
+**Without an MCP connection.** Set `CORTEX_NOTIFY_URL`, which must be a loopback address, and optionally `CORTEX_NOTIFY_TOKEN`. The Cortex app then POSTs each change to that address as JSON.
+
+## Conversation archive and gateway (cortex.event/1)
+
+**Two layers.**
+- `Conversations/` is the **archive**: what was said, appended to and never rewritten.
+- Everything else is **knowledge** (see Organizing).
+
+**How to send messages in.**
+- MCP: `brain_ingest_events {events: [...]}`. Results per event: `archived`, `duplicate`, `invalid` (with reasons) or `queued`.
+- Or drop JSONL files into `<vault>/.cortex/drop/`.
+- Or let a provider adapter capture them.
+
+**The event shape:**
+```json
+{"provider": "core", "kind": "message",
+ "session": {"id": "abc", "title": "…", "project": "…", "started": "ISO"},
+ "message": {"id": "m1", "role": "user|assistant|tool|system", "text": "…", "ts": "ISO", "model": "…"},
+ "attachments": [{"name": "plan.pdf", "mime": "application/pdf", "size": 1234, "sha256": "…", "uri": "/path"}],
+ "provenance": {"source_uri": "…"}}
+```
+
+**Identity.** IDs are derived, so the same message is stored once on every device:
+- `message_key = sha256(provider|session|message.id)[:12]`
+- `content_hash = sha256(text)[:8]`
+
+  Each archived block carries `<!-- m:<key> h:<hash> -->`.
+- Same key and same hash: a duplicate.
+- Same key, new hash: appended as "(revised)". The original stays.
+
+**What it never does.**
+- Store an attachment's bytes. Attachments are references only.
+- Keep credentials. They are redacted before writing.
+- Lose invalid input. It is kept in the gateway's local database for inspection.
+
+**Adapters.** Each declares its real capabilities: `cortex gateway capabilities`.
+
+| Provider | How | Real time | Tested |
+|---|---|---|---|
+| claude-code | Transcripts in `~/.claude/projects`, and the Stop/SessionEnd hook | Near real time with the hook | Live |
+| file-drop (any tool) | `<vault>/.cortex/drop/*.jsonl` | On the next run | Live |
+| core | MCP `brain_ingest_events` | Yes | Mocked; COre patch pending |
+| codex, gemini-cli, cursor | Local history files, read on scan or by the app's importer | No | Fixture |
+| chatgpt, claude-ai | **Export only** (`cortex import <zip>` or `cortex gateway import <zip>`) | No | Fixture |
+| gemini (web) | **Google Takeout only**, partial: activity records grouped by day | No | Fixture |
+| rest | `POST /api/events` on the local app, with `Authorization: Bearer <cortex gateway token>` | Yes | Mocked |
+
+**The queue.** It is machine-local (`gateway.db` in the local state folder) and idempotent.
+- Failed deliveries are retried with backoff (2 s, doubling). After 8 failures an event is parked as a dead letter.
+- `cortex gateway status` shows the queue; `cortex gateway retry [--dead]` tries again.
+
+**Capture rules.** They live in `.cortex/capture.json` and can be edited in Settings → Capture:
+- turn a provider off
+- set how many days to keep a provider's conversations
+- exclude projects with glob patterns
+- add extra redaction patterns
+
+Events that match a rule come back `skipped` and are never stored or queued.
+
+**Forget.** `cortex gateway forget [provider] [--session ID] [--before DATE] [--dry-run]`, or `POST /api/forget` with `confirm: true`.
+- Archive notes are deleted for good, along with their history copies and queued copies.
+- A tombstone goes into `.cortex/tombstones/<DEVICE>.jsonl`, which syncs. From then on, capture on any device skips that conversation.
+
+**Retention.** `cortex gateway retain`, which the app also runs hourly, applies `retention_days` using the same forget mechanism.
+
+## Verified knowledge (review)
+
+**What counts as verified.** Something stored with `brain_ingest` is verified when:
+- you wrote it in the app, or
+- `source=user` (the user said it), or
+- the call passes `verified=true`.
+
+**Everything else waits for review.** That covers what a model inferred, and anything from the web, desktop or email.
+- Short items go to `Inbox/Review.md` as `[verified:: false] [ref:: …]`.
+- Long ones become an Inbox note with `verified: false` in its frontmatter.
+- Tasks in them are listed as *proposed*, not as checkboxes, so they stay off your task list until accepted.
+
+**Reviewing.** `brain_verify` lists, accepts or rejects these items; the app's Home page shows them too.
+- Accepting files the item where it belongs, and keeps who suggested it and where it came from.
+- Every review is an undoable change-set.
+
+**In search results.** Recall ranks unverified passages lower and marks them with `verified: false`. `brain_records` returns `verified` and `ref`.
+
+## Retrieval tools
+
+- `brain_conversation`: list past conversations from every app, with provider and session. Pass a session to read one.
+- `brain_project`: a project's note, decisions, open tasks, recent changes, linked notes and related conversations, within a token budget.
+- `brain_about`: version, contract and features, vault path, device, sync tools in use, and the capture queue.
+
+## Sync
+
+Use one sync tool per vault; Syncthing is recommended.
+- Health warns when Syncthing and a cloud drive both carry the vault.
+- `cortex cloud` refuses to move a vault that Syncthing is already syncing.
