@@ -404,6 +404,15 @@ def main(argv=None) -> None:
             s.add_argument("--agent", help="name shown in the logbook")
         if name == "connect":
             s.add_argument("--all", action="store_true", help="also write configs for apps not detected")
+    g = sub.add_parser("gateway", help="capture conversations from AI providers (scan, hook, drop, status, retry)")
+    g.add_argument("action", choices=["scan", "hook", "drop", "status", "retry", "capabilities"])
+    g.add_argument("provider", nargs="?", help="e.g. claude-code")
+    g.add_argument("--provider", dest="provider_opt")
+    g.add_argument("--dead", action="store_true", help="with retry: also retry dead letters")
+    g.add_argument("--vault")
+    cv = sub.add_parser("config", help="show or set settings (e.g. `cortex config vault`)")
+    cv.add_argument("key", choices=["vault"])
+    cv.add_argument("value", nargs="?")
     r = sub.add_parser("restore", help="restore a backup into a new folder")
     r.add_argument("zip")
     r.add_argument("target")
@@ -419,15 +428,34 @@ def main(argv=None) -> None:
         return cmd_restore(args)
     if cmd == "connect":
         return cmd_connect(args)
+    if cmd == "config":
+        cfg = load_config()
+        if args.value:
+            v = Path(args.value).expanduser().resolve()
+            cfg["vault"] = str(v)
+            save_config(cfg)
+        print(cfg.get("vault") or str(vault_path(None)))
+        return
     if cmd == "app" and not (getattr(args, "vault", None) or os.environ.get("CORTEX_VAULT") or load_config().get("vault")):
         # First launch (e.g. double-clicking Cortex.exe): create the brain in Documents\Cortex.
         cmd_init(argparse.Namespace(vault=None))
     vault = vault_path(getattr(args, "vault", None))
-    if cmd != "mcp":
+    if cmd not in ("mcp", "gateway"):
         upgrade_rules(vault)
     if cmd == "mcp":
         from .mcp_server import run
         return run(str(vault), getattr(args, "agent", None))
+    if cmd == "gateway":
+        from cortex_gateway.cli import run as gw_run
+        try:
+            r = gw_run(vault, args.action, args.provider_opt or args.provider, args.dead)
+        except Exception as e:
+            if args.action != "hook":
+                raise
+            print(f"cortex gateway hook: {e}", file=sys.stderr)  # a hook must never fail the AI app
+            return
+        print(json.dumps(r, indent=2, ensure_ascii=False, default=str))
+        return
     if cmd == "import":
         from .core import Brain
         from .importers import Importer

@@ -83,3 +83,49 @@ Results are exact up to 1,500 notes. Above that, closeness and betweenness are e
 **Catching up.** After being away, call `brain_changes since=<cursor>`.
 
 **Without an MCP connection.** Set `CORTEX_NOTIFY_URL`, which must be a loopback address, and optionally `CORTEX_NOTIFY_TOKEN`. The Cortex app then POSTs each change to that address as JSON.
+
+## Conversation archive and gateway (cortex.event/1)
+
+**Two layers.**
+- `Conversations/` is the **archive**: what was said, appended to and never rewritten.
+- Everything else is **knowledge** (see Organizing).
+
+**How to send messages in.**
+- MCP: `brain_ingest_events {events: [...]}`. Results per event: `archived`, `duplicate`, `invalid` (with reasons) or `queued`.
+- Or drop JSONL files into `<vault>/.cortex/drop/`.
+- Or let a provider adapter capture them.
+
+**The event shape:**
+```json
+{"provider": "core", "kind": "message",
+ "session": {"id": "abc", "title": "…", "project": "…", "started": "ISO"},
+ "message": {"id": "m1", "role": "user|assistant|tool|system", "text": "…", "ts": "ISO", "model": "…"},
+ "attachments": [{"name": "plan.pdf", "mime": "application/pdf", "size": 1234, "sha256": "…", "uri": "/path"}],
+ "provenance": {"source_uri": "…"}}
+```
+
+**Identity.** IDs are derived, so the same message is stored once on every device:
+- `message_key = sha256(provider|session|message.id)[:12]`
+- `content_hash = sha256(text)[:8]`
+
+  Each archived block carries `<!-- m:<key> h:<hash> -->`.
+- Same key and same hash: a duplicate.
+- Same key, new hash: appended as "(revised)". The original stays.
+
+**What it never does.**
+- Store an attachment's bytes. Attachments are references only.
+- Keep credentials. They are redacted before writing.
+- Lose invalid input. It is kept in the gateway's local database for inspection.
+
+**Adapters.** Each declares its real capabilities: `cortex gateway capabilities`.
+
+| Provider | How | Real time | Tested |
+|---|---|---|---|
+| claude-code | Transcripts in `~/.claude/projects`, and the Stop/SessionEnd hook | Near real time with the hook | Live |
+| file-drop (any tool) | `<vault>/.cortex/drop/*.jsonl` | On the next run | Live |
+| core | MCP `brain_ingest_events` | Yes | Mocked; COre patch pending |
+| codex, gemini-cli, cursor, chatgpt, claude-ai | Still through `cortex import` (moving to adapters in M2). ChatGPT and Claude.ai are **export-only**. | No | Fixture |
+
+**The queue.** It is machine-local (`gateway.db` in the local state folder) and idempotent.
+- Failed deliveries are retried with backoff (2 s, doubling). After 8 failures an event is parked as a dead letter.
+- `cortex gateway status` shows the queue; `cortex gateway retry [--dead]` tries again.

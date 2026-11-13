@@ -23,6 +23,15 @@
   - Writes can carry a per-helper identity (`core/forge`).
   - Batches can be atomic or dry-run.
   - Opt-in push events tell COre about changes, edits made in Obsidian, and tasks coming due.
+- **Captures your AI sessions as they happen.** The memory gateway turns conversations from any provider into one event format. It stores them append-only in `Conversations/`, without duplicates across devices and with credentials redacted, through a retrying queue.
+  - **Claude Code, near real time:** add the hook below to `~/.claude/settings.json`. Cortex never edits it for you.
+
+    ```json
+    {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "cortex gateway hook claude-code"}]}]}}
+    ```
+
+  - **Status:** `cortex gateway status`.
+  - **What each provider really supports:** `cortex gateway capabilities`. ChatGPT and Claude.ai web only offer export files.
 - **Fast.** On a 10,000-note vault: search about 6 ms, recall about 10 ms, append under 1 ms. Run `python scripts/bench.py` to check.
 
 - **Your notes stay yours.** Everything is plain Markdown in a folder, so it opens in Obsidian too.

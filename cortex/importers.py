@@ -524,6 +524,13 @@ class Importer:
                 if prev and prev.get("sig") == c.sig and (self.brain.root / prev["path"]).exists():
                     continue
                 rel = prev["path"] if prev else note_path(c)
+                existing = self.brain.root / rel
+                try:  # the gateway owns this conversation now (append-only, anchored): never overwrite it
+                    if existing.exists() and "<!-- m:" in existing.read_text(encoding="utf-8", errors="replace"):
+                        notes[c.key] = {"sig": c.sig, "path": rel}
+                        continue
+                except OSError:
+                    pass
                 try:
                     self.brain.store(rel, render(c))
                 except (ValueError, OSError) as e:  # one odd conversation must not stop the import
