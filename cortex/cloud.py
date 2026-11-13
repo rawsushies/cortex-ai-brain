@@ -213,6 +213,21 @@ def restore(zip_path: Path, target: Path) -> dict:
 
 
 # ── sync conflicts ───────────────────────────────────────────────────────
+def sync_providers(vault: Path) -> list[dict]:
+    """Which sync tools carry this vault. One is fine; two (say Syncthing inside a Google Drive folder)
+    copy each other's half-written files and multiply conflicts."""
+    vault = Path(vault).resolve()
+    found = []
+    for d in [vault, *vault.parents]:
+        if (d / ".stfolder").exists():
+            found.append({"provider": "Syncthing", "path": str(d)})
+            break
+    cloud = provider_for(vault)
+    if cloud:
+        found.append({"provider": cloud["provider"], "path": cloud.get("path") or str(vault)})
+    return found
+
+
 def conflict_copies(paths: list[str]) -> list[dict]:
     """Notes that look like a sync app's duplicate when two devices edited at once.
     "Plan (1).md" only counts when "Plan.md" also exists, to avoid false alarms."""

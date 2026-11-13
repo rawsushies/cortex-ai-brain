@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 6  # bump when the index layout changes; the index then rebuilds itself
+SCHEMA_VERSION = 7  # bump when the index layout changes; the index then rebuilds itself
 SKIP_DIRS = {".cortex", ".obsidian", ".git", ".trash", "node_modules", ".venv"}
 # Root-level files each AI host reads on its own; plumbing, not notes.
 POINTER_FILES = {"agents.md", "claude.md", "gemini.md"}
@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS notes(
   tags TEXT, words INTEGER, status TEXT, created REAL, category TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS records(path TEXT, line INTEGER, type TEXT, category TEXT, source TEXT, by TEXT,
-  day TEXT, text TEXT);
+  day TEXT, text TEXT, verified INTEGER DEFAULT 1, ref TEXT DEFAULT '');
 CREATE INDEX IF NOT EXISTS records_path ON records(path);
 CREATE INDEX IF NOT EXISTS records_type ON records(type);
 CREATE INDEX IF NOT EXISTS notes_category ON notes(category);
@@ -365,7 +365,8 @@ class Brain:
                     day = re.search(r"\d{4}-\d{2}-\d{2}", line) or re.search(r"\d{4}-\d{2}-\d{2}", rel)
                     clean = FIELDS.sub("", re.sub(r"^\s*[-*+]\s+", "", line)).strip()
                     records.append((rel, i, f["type"][:20], f.get("category", "")[:40], f.get("source", "")[:24],
-                                    f.get("by", "")[:48], day.group(0) if day else "", clean[:500]))
+                                    f.get("by", "")[:48], day.group(0) if day else "", clean[:500],
+                                    0 if f.get("verified", "").lower() in ("false", "no", "0") else 1, f.get("ref", "")[:300]))
         category = str(meta.get("category") or "").strip()[:40] if not isinstance(meta.get("category"), list) else ""
         if not category:
             category = self._infer_category(rel, title, body)
@@ -387,7 +388,7 @@ class Brain:
         db.execute("INSERT INTO fts(rowid,title,tags,body) VALUES(?,?,?,?)", (nid, title, " ".join(tags), body))
         db.executemany("INSERT INTO links(src,dst,dst_l) VALUES(?,?,?)", [(rel, l, l.lower()) for l in links])
         db.executemany("INSERT INTO tasks(path,line,text,done,due) VALUES(?,?,?,?,?)", tasks)
-        db.executemany("INSERT INTO records(path,line,type,category,source,by,day,text) VALUES(?,?,?,?,?,?,?,?)", records)
+        db.executemany("INSERT INTO records(path,line,type,category,source,by,day,text,verified,ref) VALUES(?,?,?,?,?,?,?,?,?,?)", records)
         self._names_add(rel, title)
         if self._norms is not None:
             self._norms[rel] = (norm_title(rel.rsplit("/", 1)[-1][:-3]), norm_title(title))
@@ -424,10 +425,13 @@ class Brain:
         return lexicon_category(title, body)[0] or ""
 
     def records(self, type: str | None = None, category: str | None = None, source: str | None = None,
-                query: str | None = None, limit: int = 50) -> list[dict]:
+                query: str | None = None, limit: int = 50, verified: bool | None = None) -> list[dict]:
         """Typed lines ([type:: decision] ...) across the vault, newest first."""
         self.sync()
-        sql, args = "SELECT path,line,type,category,source,by,day,text FROM records WHERE 1", []
+        sql, args = "SELECT path,line,type,category,source,by,day,text,verified,ref FROM records WHERE 1", []
+        if verified is not None:
+            sql += " AND verified=?"
+            args.append(1 if verified else 0)
         for col, val in (("type", type), ("category", category), ("source", source)):
             if val:
                 sql += f" AND lower({col})=?"
@@ -438,7 +442,7 @@ class Brain:
                 args.append(f"%{w}%")
         sql += " ORDER BY day DESC, path, line LIMIT ?"
         args.append(max(1, min(int(limit), 500)))
-        return [dict(r) for r in self.db.execute(sql, args)]
+        return [{**dict(r), "verified": bool(r["verified"])} for r in self.db.execute(sql, args)]
 
     def categories(self) -> list[dict]:
         self.sync()
@@ -751,7 +755,11 @@ class Brain:
                     score = w * 1.2
                 else:
                     continue
+                unverified = "[verified:: false]" in chunk or str(meta.get("verified", "")).lower() == "false"
+                if unverified:
+                    score *= 0.6  # waiting for the user's review: still findable, ranked below confirmed knowledge
                 passages.append({"path": path, "title": title, "heading": heading, "text": chunk, "score": score,
+                                 "verified": not unverified,
                                  "pos": pos, "opens": opens_section, "via": via.get(path),
                                  "external": str(meta.get("trust", "")).lower() == "external" or "[source:: web]" in chunk})
         passages.sort(key=lambda p: -p["score"])
@@ -778,7 +786,7 @@ class Brain:
         order = {p: i for i, p in enumerate(dict.fromkeys(c["path"] for c in chosen))}
         chosen.sort(key=lambda c: (order[c["path"]], c["pos"]))
         more = [p for p, _ in sorted(weight.items(), key=lambda x: -x[1]) if p not in order][:8]
-        out = {"query": query, "passages": [{k: c[k] for k in ("path", "title", "heading", "text", "via", "external")} for c in chosen],
+        out = {"query": query, "passages": [{k: c[k] for k in ("path", "title", "heading", "text", "via", "external", "verified")} for c in chosen],
                "more": more, "tokens": used, "budget": budget, "notes": len(order)}
         if len(self._recall_cache) > 200:
             self._recall_cache.clear()
@@ -1396,7 +1404,29 @@ class Brain:
             "orphans": sorted(orphans),
             "too_long": big,
             "decisions_to_review": review,
+            "sync_providers": self._sync_providers(),
+            "gateway_dead": self._gateway_dead(),
         }
+
+    def _sync_providers(self) -> list[dict]:
+        try:
+            from .cloud import sync_providers
+            return sync_providers(self.root)
+        except Exception:
+            return []
+
+    def _gateway_dead(self) -> int:
+        f = self.local_dir / "gateway.db"
+        if not f.exists():
+            return 0
+        try:
+            c = sqlite3.connect(f, timeout=2)
+            try:
+                return c.execute("SELECT count(*) FROM events WHERE state='dead'").fetchone()[0]
+            finally:
+                c.close()
+        except sqlite3.Error:
+            return 0
 
     def _superseded_decisions(self) -> list[dict]:
         """Two decisions in the same note about the same thing, saying different things: the later

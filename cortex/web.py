@@ -153,6 +153,7 @@ def make_handler(brain: Brain):
                 "/api/rules": lambda: _rules_get(brain),
                 "/api/capture-rules": lambda: _gwrules().load(brain.root),
                 "/api/gateway": lambda: _gateway_status(brain),
+                "/api/review": lambda: _organize.Organizer(brain).review_items(),
                 "/api/conversations": lambda: brain.recent(_int(q.get("limit"), 200), conversations="only") if not q.get("q")
                     else [h.__dict__ for h in brain.search(q["q"], _int(q.get("limit"), 50), scope="conversations")],
             }
@@ -258,6 +259,8 @@ def make_handler(brain: Brain):
                     self._json(_topics(brain))
                 elif u.path == "/api/rules":
                     self._json(_rules_put(brain, b))
+                elif u.path == "/api/review":
+                    self._json(_organize.Organizer(brain).verify(b["path"], b.get("text") or None, b.get("action") or "accept", agent="you"))
                 elif u.path == "/api/capture-rules":
                     self._json(_gwrules().save(brain.root, b))
                 elif u.path == "/api/forget":

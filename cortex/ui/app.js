@@ -351,8 +351,8 @@ function wireUndo(root = view) {
 async function viewHome() {
   setTop("<b>Home</b>", `<button class="btn primary" id="homeNew">New note</button>`);
   $("#homeNew").onclick = () => newNote();
-  const [stats, recent, acts, setup, changes, cats] = await Promise.all([get("/api/stats"), get("/api/recent?limit=10"),
-    get("/api/activity?limit=10"), get("/api/setup"), get("/api/changes?limit=8"), get("/api/categories")]);
+  const [stats, recent, acts, setup, changes, cats, review] = await Promise.all([get("/api/stats"), get("/api/recent?limit=10"),
+    get("/api/activity?limit=10"), get("/api/setup"), get("/api/changes?limit=8"), get("/api/categories"), get("/api/review")]);
   const agents = new Set(acts.map((a) => a.agent).filter((a) => a !== "you" && a !== "human"));
   const hour = new Date().getHours();
   const greet = hour < 12 ? "Morning." : hour < 18 ? "Afternoon." : "Evening.";
@@ -360,6 +360,12 @@ async function viewHome() {
     <h1 class="hello">${greet}</h1>
     <p class="sub">Remembers. Locally. Every AI you connect reads and writes this one brain.</p>
     ${setupCard(setup)}
+    ${review.length ? `<h3 class="panel-title">Waiting for your review <span>${review.length}</span></h3>
+      <p class="why">An AI or an app suggested these. Accept to file them as knowledge (tasks join your list); reject to remove them.</p>
+      <div class="list" style="margin-bottom:6px">${review.slice(0, 12).map((r, i) => `<div class="row"><span class="pill">${esc(r.proposed_task ? "task" : r.type)}</span>
+        <div class="t"><div>${r.line === null ? `<a href="#/note/${enc(r.path)}">${esc(r.text)}</a>` : esc(r.text)}</div>
+        <div class="p">${esc([r.by && "by " + r.by, r.source && "from " + r.source, r.project && "project " + r.project, r.ref && "ref " + r.ref].filter(Boolean).join(" · "))}</div></div>
+        <button class="btn" data-rv="${i}" data-act="reject">Reject</button><button class="btn primary" data-rv="${i}" data-act="accept">Accept</button></div>`).join("")}</div>` : ""}
     <div class="stats">
       <div class="stat"><div class="n">${stats.notes.toLocaleString()}</div><div class="l">notes</div></div>
       <a class="stat" href="#/tasks"><div class="n">${stats.open_tasks.toLocaleString()}</div><div class="l">open tasks</div></a>
@@ -383,6 +389,14 @@ async function viewHome() {
     </div>`;
   wireSetup();
   wireUndo();
+  view.querySelectorAll("[data-rv]").forEach((btn) => (btn.onclick = async () => {
+    const r = review[+btn.dataset.rv];
+    try {
+      const out = await post("/api/review", { path: r.path, text: r.line === null ? "" : r.text, action: btn.dataset.act });
+      toast(out.action === "accepted" ? `Filed in ${titleOf(out.filed_in)}` : "Removed", false, { label: "Undo", run: () => undoChange(out.changeset) });
+      await loadSidebar(); viewHome();
+    } catch (e) { toast(e.message, true); }
+  }));
   setContext("");
   touchTab("Home");
 }

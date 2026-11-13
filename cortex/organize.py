@@ -296,6 +296,13 @@ def near_duplicate(brain, text: str) -> dict | None:
     return None
 
 
+def _review_text(line: str) -> str:
+    """The item itself, without the bullet, date, 'proposed task:' and [fields]."""
+    t = re.sub(r"\s*\[[\w-]+::[^\]]*\]", "", line)
+    t = re.sub(r"^\s*[-*]\s+(\d{4}-\d{2}-\d{2}\s+)?(proposed task:\s*)?", "", t)
+    return t.strip()
+
+
 def title_from(text: str, limit: int = 70) -> str:
     for line in text.strip().splitlines():
         line = re.sub(r"^#+\s*", "", _plain(line)).strip()
@@ -310,13 +317,14 @@ class Organizer:
     def __init__(self, brain):
         self.brain = brain
 
-    def _record_line(self, kind: str, text: str, cat: str | None, source: str, agent: str, stamp: str) -> str:
+    def _record_line(self, kind: str, text: str, cat: str | None, source: str, agent: str, stamp: str,
+                     extra: str = "") -> str:
         fields = f"[type:: {kind}]" + (f" [category:: {cat}]" if cat else "")
         if source and source != "user":
             fields += f" [source:: {source}]"
         if agent not in ("you", "human"):
             fields += f" [by:: {agent}]"
-        return f"- {stamp} {' '.join(text.split())} {fields}"
+        return f"- {stamp} {' '.join(text.split())} {fields}{extra}"
 
     def _unique(self, folder: str, title: str) -> str:
         from .importers import _safe
@@ -328,7 +336,7 @@ class Organizer:
 
     def ingest(self, text: str, agent: str = "human", source: str = "user", kind: str | None = None,
                title: str | None = None, project: str | None = None, today: date | None = None,
-               dedupe: bool = True) -> dict:
+               dedupe: bool = True, verified: bool | None = None, ref: str | None = None, reviewed: bool = False) -> dict:
         """Store anything in the right place, in one call: a fact, decision, lesson, idea, task,
         a long note or a whole conversation. Returns what Cortex did, so the caller can say it
         (or undo it with the change-set id)."""
@@ -351,6 +359,13 @@ class Organizer:
             raise ValueError("type must be note, fact, decision, lesson, idea, task or conversation")
         if kind == "conversation":
             return self._ingest_conversation(text, agent, source, title, today)
+        # Who vouches for it? You (in the app) and things the user said are verified; anything a model
+        # inferred, or taken from the web/desktop/email, waits in Inbox/Review.md until you accept it.
+        if verified is None:
+            verified = agent in ("you", "human") or source == "user"
+        ref = " ".join(str(ref or "").split())[:300]
+        if not verified:
+            return self._ingest_unverified(text, agent, source, kind, title, project, today, ref)
         cat = categorize(b, title or "", text)
         found = find_tasks(text, today)
         open_now = {_norm(t["text"].split(" 📅")[0]): t["path"] for t in b.tasks("open", limit=2000)}
@@ -379,7 +394,8 @@ class Organizer:
                     section = SECTION_FOR.get(kind, "Notes") if dest else "Log"
                     if not dest and not b.resolve(target).exists():
                         b.write(target, f"# {today.isoformat()}\n\n## Log\n", agent=agent, mode="create", log=False)
-                    b.write_section(target, section, self._record_line(kind, linked, cat["category"], source, agent, stamp),
+                    extra = (f" [ref:: {ref}]" if ref else "") + (" [verified:: true] [reviewed:: you]" if reviewed else "")
+                    b.write_section(target, section, self._record_line(kind, linked, cat["category"], source, agent, stamp, extra),
                                     agent=agent, mode="append")
                     path = target
             else:
@@ -413,7 +429,111 @@ class Organizer:
         return {"action": "stored", "path": path, "type": kind, "category": cat["category"],
                 "confidence": cat["confidence"], "why": cat["why"], "folder_suggestion": cat.get("folder"),
                 "tasks": added, "links": [e["path"] for e in ents if e["path"] != dest], "project": dest,
-                "stubs": stubs, "duplicate_of": None, "changeset": cs["id"] if cs["files"] else None}
+                "stubs": stubs, "duplicate_of": None, "verified": True, "changeset": cs["id"] if cs["files"] else None}
+
+    # ── review: knowledge nobody has vouched for yet ─────────────────────
+    REVIEW = "Inbox/Review.md"
+
+    def _ingest_unverified(self, text, agent, source, kind, title, project, today, ref) -> dict:
+        """Uncertain information goes to the Inbox, never straight into permanent knowledge. Tasks
+        are listed as proposals (not checkboxes), so they don't appear on the task list until accepted."""
+        b = self.brain
+        kind = (kind or detect_type(text)).lower()
+        cat = categorize(b, title or "", text)
+        tasks = find_tasks(text, today)
+        dest = b.find(project) if project else None
+        hint = f" [project:: {Path(dest).stem if dest else project}]" if (dest or project) else ""
+        fields = " [verified:: false]" + (f" [ref:: {ref}]" if ref else "") + hint
+        short = len(text) <= 500 and text.count("\n") <= 3
+        with b.changeset(agent, f"ingest {kind} (to review)") as cs:
+            if short:
+                path = self.REVIEW
+                if not b.resolve(path).exists():
+                    b.write(path, "# Review\n\nThings an AI or an app suggested. Accept them to file them as knowledge, "
+                                  "or reject them. (brain_verify, or the Inbox in the Cortex app)\n", agent=agent, mode="create", log=False)
+                if kind != "task" or not tasks:
+                    b.write_section(path, f"{kind.capitalize()}s to review", self._record_line(
+                        kind, text, cat["category"], source, agent, today.isoformat(), fields), agent=agent, mode="append")
+            else:
+                name = title or title_from(text)
+                path = self._unique("Inbox", name)
+                fm = ["---", f"type: {kind}", f"created: {today.isoformat()}", "verified: false"]
+                fm += [f"category: {cat['category']}"] if cat["category"] else []
+                fm += [f"source: {source}"] + (["trust: external"] if source == "web" else []) if source != "user" else []
+                fm += [f"by: {agent}"] if agent not in ("you", "human") else []
+                fm += [f"ref: {json.dumps(ref)}"] if ref else []
+                fm += [f"project: {json.dumps(Path(dest).stem if dest else project)}"] if (dest or project) else []
+                heading = "" if re.match(r"^#\s", text) else f"# {name}\n\n"
+                b.write(path, "\n".join(fm + ["---"]) + "\n" + heading + text, agent=agent, mode="create")
+            for t in tasks:
+                by = f" [by:: {agent}]" if agent not in ("you", "human") else ""
+                src = f" [source:: {source}]" if source and source != "user" else ""
+                b.write_section(path, "Proposed tasks", f"- proposed task: {t['text']}" + (f" [due:: {t['due']}]" if t["due"] else "")
+                                + src + by + fields, agent=agent, mode="append")
+        return {"action": "review", "path": path, "type": kind, "category": cat["category"], "verified": False,
+                "tasks": [{"text": t["text"], "due": t["due"], "proposed": True} for t in tasks], "links": [], "project": dest,
+                "stubs": [], "duplicate_of": None, "changeset": cs["id"]}
+
+    def review_items(self) -> list[dict]:
+        """Everything waiting for review: lines in Inbox/Review.md and unverified Inbox notes."""
+        b = self.brain
+        b.sync()
+        out = []
+        p = b.resolve(self.REVIEW)
+        if p.exists():
+            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "[verified:: false]" in line:
+                    f = dict((k.lower(), v.strip()) for k, v in re.findall(r"\[([\w-]+)::\s*([^\]]*)\]", line))
+                    out.append({"path": self.REVIEW, "line": line, "text": _review_text(line), "type": f.get("type", "task"),
+                                "by": f.get("by", ""), "source": f.get("source", ""), "ref": f.get("ref", ""),
+                                "project": f.get("project", ""), "proposed_task": "proposed task:" in line})
+        for r in b.db.execute("SELECT path, title FROM notes WHERE path LIKE 'Inbox/%' AND path != ?", (self.REVIEW,)):
+            meta = b.read(r["path"])["meta"]
+            if str(meta.get("verified", "")).lower() == "false":
+                out.append({"path": r["path"], "line": None, "text": r["title"], "type": meta.get("type", "note"),
+                            "by": meta.get("by", ""), "source": meta.get("source", ""), "ref": meta.get("ref", ""),
+                            "project": str(meta.get("project", "")), "proposed_task": False})
+        return out
+
+    def verify(self, path: str, text: str | None = None, action: str = "accept", agent: str = "you") -> dict:
+        """Accept (file it as knowledge) or reject (remove it) something waiting for review: one line of
+        Inbox/Review.md (give part of its text) or a whole unverified Inbox note (no text)."""
+        b = self.brain
+        if action not in ("accept", "reject"):
+            raise ValueError("action must be accept or reject")
+        rel = b._must_find(path)
+        content = b.resolve(rel).read_text(encoding="utf-8", errors="replace")
+        with b.changeset(agent, f"review: {action}") as cs:
+            if not text:  # a whole note
+                meta = b.read(rel)["meta"]
+                if str(meta.get("verified", "")).lower() != "false":
+                    raise ValueError(f"{rel} isn't waiting for review")
+                if action == "reject":
+                    b.delete(rel, agent=agent)
+                    return {"action": "rejected", "path": rel, "changeset": cs["id"]}
+                b.edit(rel, "verified: false", "verified: true\nreviewed: you", agent=agent)
+                filed = None
+            else:
+                lines = [l for l in content.splitlines() if "[verified:: false]" in l and text.lower() in l.lower()]
+                if not lines:
+                    raise ValueError("no item waiting for review matches that text")
+                if len(lines) > 1:
+                    raise ValueError(f"{len(lines)} items match; give more of the text")
+                line = lines[0]
+                b.edit(rel, line + "\n" if line + "\n" in content else line, "", agent=agent)
+                if action == "reject":
+                    return {"action": "rejected", "path": rel, "item": _review_text(line), "changeset": cs["id"]}
+                f = dict((k.lower(), v.strip()) for k, v in re.findall(r"\[([\w-]+)::\s*([^\]]*)\]", line))
+                body = _review_text(line)
+                if "proposed task:" in line:
+                    proj = b.find(f["project"]) if f.get("project") else None
+                    r = b.add_task(body, proj, f.get("due"), agent=agent)
+                    filed = r["path"]
+                else:
+                    r = self.ingest(body, agent=f.get("by") or agent, source=f.get("source") or "user", kind=f.get("type"),
+                                    project=f.get("project") or None, dedupe=False, verified=True, ref=f.get("ref"), reviewed=True)
+                    filed = r["path"]
+        return {"action": "accepted", "path": rel, "filed_in": filed or rel, "changeset": cs["id"]}
 
     def _ingest_conversation(self, text: str, agent: str, source: str, title: str | None, today: date) -> dict:
         b = self.brain

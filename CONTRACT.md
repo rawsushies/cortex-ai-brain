@@ -146,3 +146,33 @@ Events that match a rule come back `skipped` and are never stored or queued.
 - A tombstone goes into `.cortex/tombstones/<DEVICE>.jsonl`, which syncs. From then on, capture on any device skips that conversation.
 
 **Retention.** `cortex gateway retain`, which the app also runs hourly, applies `retention_days` using the same forget mechanism.
+
+## Verified knowledge (review)
+
+**What counts as verified.** Something stored with `brain_ingest` is verified when:
+- you wrote it in the app, or
+- `source=user` (the user said it), or
+- the call passes `verified=true`.
+
+**Everything else waits for review.** That covers what a model inferred, and anything from the web, desktop or email.
+- Short items go to `Inbox/Review.md` as `[verified:: false] [ref:: …]`.
+- Long ones become an Inbox note with `verified: false` in its frontmatter.
+- Tasks in them are listed as *proposed*, not as checkboxes, so they stay off your task list until accepted.
+
+**Reviewing.** `brain_verify` lists, accepts or rejects these items; the app's Home page shows them too.
+- Accepting files the item where it belongs, and keeps who suggested it and where it came from.
+- Every review is an undoable change-set.
+
+**In search results.** Recall ranks unverified passages lower and marks them with `verified: false`. `brain_records` returns `verified` and `ref`.
+
+## Retrieval tools
+
+- `brain_conversation`: list past conversations from every app, with provider and session. Pass a session to read one.
+- `brain_project`: a project's note, decisions, open tasks, recent changes, linked notes and related conversations, within a token budget.
+- `brain_about`: version, contract and features, vault path, device, sync tools in use, and the capture queue.
+
+## Sync
+
+Use one sync tool per vault; Syncthing is recommended.
+- Health warns when Syncthing and a cloud drive both carry the vault.
+- `cortex cloud` refuses to move a vault that Syncthing is already syncing.

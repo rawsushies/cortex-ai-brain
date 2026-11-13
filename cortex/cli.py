@@ -304,6 +304,15 @@ def cmd_cloud(args) -> None:
     vault = vault_path(args.vault)
     cfg = load_config()
     prov = cloud.provider_for(vault)
+    st = next((s for s in cloud.sync_providers(vault) if s["provider"] == "Syncthing"), None)
+    if st and not prov:
+        print(f"This brain already syncs with Syncthing ({st['path']}).\n"
+              "Don't also put it in a cloud drive: two sync tools on one folder copy each other's half-written\n"
+              "files and multiply conflicts. Keep Syncthing (recommended), or remove it before moving to a cloud drive.")
+        return
+    if not prov:
+        print("Tip: Syncthing (free, device to device, no cloud account) is the recommended way to share a brain\n"
+              "between your computers; COre can set it up. This command moves the brain into a cloud drive instead.\n")
     print(f"Your brain: {vault}")
     print(f"This device: {__import__('cortex.core', fromlist=['DEVICE']).DEVICE}\n")
     if prov:

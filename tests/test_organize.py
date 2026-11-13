@@ -136,7 +136,7 @@ class IngestTest(Base):
     def test_long_note_to_inbox_with_category_and_undo(self):
         long = ("Notes from the gym consultation.\n\n" + "The trainer suggested a workout plan with three sessions a week, "
                 "more protein and better sleep. " * 8 + "\n\nI need to book a doctor appointment next week.")
-        r = self.call("brain_ingest", text=long, source="desktop", actor="agent")["structuredContent"]
+        r = self.call("brain_ingest", text=long, source="desktop", actor="agent", verified=True)["structuredContent"]
         self.assertTrue(r["path"].startswith("Inbox/Notes from the gym consultation"))
         self.assertEqual(r["category"], "Health")
         note = (self.b.root / r["path"]).read_text()
