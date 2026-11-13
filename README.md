@@ -44,6 +44,8 @@
 - **Fast.** On a 5,000-note vault: search 10ms, save (with a version snapshot) 1ms, full health check 100ms, re-check for changed files 80ms.
 - **Nothing to install** except Python 3.10+. It uses no packages, no cloud and no account. The app only listens on your own computer.
 
+**What's next:** the [Universal AI Memory roadmap](docs/UNIVERSAL_AI_MEMORY_ROADMAP.md) covers provenance for every AI conversation, one memory contract for every AI provider, and opt-in phone access while your PC is off. It is planned, not built yet.
+
 ## Install (Windows): Cortex.exe
 
 No Python needed.
