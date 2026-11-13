@@ -69,7 +69,7 @@ class Queue:
         while True:
             t = time.time() if now is None else now
             rows = self.db.execute("SELECT event_id,payload,attempts FROM events WHERE state='pending' AND next_at<=? "
-                                   "ORDER BY created, event_id LIMIT ?", (t, batch)).fetchall()
+                                   "ORDER BY created, rowid LIMIT ?", (t, batch)).fetchall()
             if not rows:
                 break
             evs = [json.loads(r[1]) for r in rows]

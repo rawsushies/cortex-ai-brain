@@ -124,8 +124,25 @@ Results are exact up to 1,500 notes. Above that, closeness and betweenness are e
 | claude-code | Transcripts in `~/.claude/projects`, and the Stop/SessionEnd hook | Near real time with the hook | Live |
 | file-drop (any tool) | `<vault>/.cortex/drop/*.jsonl` | On the next run | Live |
 | core | MCP `brain_ingest_events` | Yes | Mocked; COre patch pending |
-| codex, gemini-cli, cursor, chatgpt, claude-ai | Still through `cortex import` (moving to adapters in M2). ChatGPT and Claude.ai are **export-only**. | No | Fixture |
+| codex, gemini-cli, cursor | Local history files, read on scan or by the app's importer | No | Fixture |
+| chatgpt, claude-ai | **Export only** (`cortex import <zip>` or `cortex gateway import <zip>`) | No | Fixture |
+| gemini (web) | **Google Takeout only**, partial: activity records grouped by day | No | Fixture |
+| rest | `POST /api/events` on the local app, with `Authorization: Bearer <cortex gateway token>` | Yes | Mocked |
 
 **The queue.** It is machine-local (`gateway.db` in the local state folder) and idempotent.
 - Failed deliveries are retried with backoff (2 s, doubling). After 8 failures an event is parked as a dead letter.
 - `cortex gateway status` shows the queue; `cortex gateway retry [--dead]` tries again.
+
+**Capture rules.** They live in `.cortex/capture.json` and can be edited in Settings → Capture:
+- turn a provider off
+- set how many days to keep a provider's conversations
+- exclude projects with glob patterns
+- add extra redaction patterns
+
+Events that match a rule come back `skipped` and are never stored or queued.
+
+**Forget.** `cortex gateway forget [provider] [--session ID] [--before DATE] [--dry-run]`, or `POST /api/forget` with `confirm: true`.
+- Archive notes are deleted for good, along with their history copies and queued copies.
+- A tombstone goes into `.cortex/tombstones/<DEVICE>.jsonl`, which syncs. From then on, capture on any device skips that conversation.
+
+**Retention.** `cortex gateway retain`, which the app also runs hourly, applies `retention_days` using the same forget mechanism.

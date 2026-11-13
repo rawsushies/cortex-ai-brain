@@ -21,9 +21,12 @@ Rules:
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import json
 import os
 import re
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,10 +45,70 @@ def legacy_ident(provider: str, session_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", session_id)[-6:] or "x"
 
 
+class Tombstones:
+    """Conversations the user deleted ("forget"), so no device and no re-scan brings them back.
+    Stored in .cortex/tombstones/<DEVICE>.jsonl (synced; one file per device, merged on read).
+    An entry blocks: one session {provider, session}; or everything up to a time {provider?, before}."""
+
+    def __init__(self, brain):
+        self.brain = brain
+        self.dir = brain.meta_dir / "tombstones"
+        self._cache: tuple = (None, [])
+
+    def entries(self) -> list[dict]:
+        files = sorted(self.dir.glob("*.jsonl")) if self.dir.is_dir() else []
+        sig = tuple((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+        if sig != self._cache[0]:
+            rows = []
+            for f in files:
+                for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(e, dict):
+                        rows.append(e)
+            self._cache = (sig, rows)
+        return self._cache[1]
+
+    def add(self, entry: dict) -> None:
+        from cortex.core import DEVICE, now_iso
+        self.dir.mkdir(exist_ok=True)
+        with open(self.dir / f"{DEVICE}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now_iso(), **entry}, ensure_ascii=False) + "\n")
+
+    def blocks(self, provider: str, session_id: str, when: str = "") -> bool:
+        for e in self.entries():
+            if e.get("provider") and e["provider"] != provider:
+                continue
+            if e.get("session"):
+                if e["session"] == session_id:
+                    return True
+                continue
+            if e.get("before") and when and when[:19] <= e["before"][:19]:
+                return True
+        return False
+
+
+def archive_meta(text: str) -> dict:
+    """provider / session / started from an archive note's frontmatter (new and legacy notes)."""
+    from cortex.core import split_frontmatter
+    from cortex_gateway.schema import DISPLAY
+    meta, _ = split_frontmatter(text[:4000])
+    provider = str(meta.get("provider") or "")
+    if not provider and meta.get("source"):
+        provider = next((k for k, v in DISPLAY.items() if v == meta["source"]), str(meta["source"]).lower().replace(" ", "-"))
+    return {"provider": provider, "session": str(meta.get("session") or ""), "started": str(meta.get("started") or ""),
+            "project": str(meta.get("project") or "").strip('"')}
+
+
 class Archive:
     def __init__(self, brain):
         self.brain = brain
         self._where: dict[tuple, str] = {}
+        self.tombstones = Tombstones(brain)
+        self.created: set[str] = set()
+        self.appended: dict[str, int] = {}
 
     # ── locating a conversation's note ───────────────────────────────────
     def _ident(self, session_id: str) -> str:
@@ -69,13 +132,13 @@ class Archive:
                     return rel
         return None
 
-    def _new_path(self, ev: dict) -> str:
+    def _new_path(self, ev: dict, title: str = "") -> str:
         from cortex.importers import _safe
         from cortex_gateway.schema import display_name
         s = ev["session"]
         started = s["started"] or ev["provenance"]["captured_at"]
         day, hm = started[:10], started[11:16].replace(":", "")
-        title = s["title"] or _first_line(ev["message"]["text"]) or "Untitled conversation"
+        title = title or s["title"] or _first_line(ev["message"]["text"]) or "Untitled conversation"
         return (f"Conversations/{_safe(display_name(ev['provider']), 30)}/{day[:7]}/"
                 f"{day} {hm} {_safe(title)} ({self._ident(s['id'])}).md")
 
@@ -122,7 +185,12 @@ class Archive:
         for (provider, sid), idxs in groups.items():
             evs = [events[i] for i in idxs]
             first = next((e for e in evs if e["kind"] == "message"), evs[0])
-            rel = self.find(provider, sid) or self._new_path(first)
+            if self.tombstones.blocks(provider, sid, first["session"]["started"] or first["message"]["ts"]):
+                for i in idxs:  # the user deleted this conversation: never bring it back
+                    results[i] = {"event_id": events[i]["event_id"], "status": "skipped", "reason": "forgotten"}
+                continue
+            title = next((e["session"]["title"] for e in evs if e["session"].get("title")), "")
+            rel = self.find(provider, sid) or self._new_path(first, title)
             with self._lock(rel):
                 out = self._append_session(rel, provider, sid, evs, agent)
             for i, r in zip(idxs, out):
@@ -137,7 +205,10 @@ class Archive:
         p = b.resolve(rel)
         created = False
         if not p.exists():
-            s = next((e["session"] for e in evs if e["session"].get("title")), evs[0]["session"])
+            msgs = [e for e in evs if e["kind"] == "message"] or evs
+            pick = lambda k: next((e["session"][k] for e in evs if e["session"].get(k)), "")
+            s = {"title": pick("title"), "project": pick("project"),  # merge what the events know about the session
+                 "started": min((e["session"]["started"] for e in msgs if e["session"].get("started")), default="")}
             title = s["title"] or _first_line(next((e["message"]["text"] for e in evs if e["kind"] == "message"), "")) or "Untitled conversation"
             fm = ["---", f"tags: [conversation, {re.sub(r'[^a-z0-9]+', '-', provider).strip('-')}]",
                   f"source: {display_name(provider)}", f"provider: {provider}", f"session: {sid}"]
@@ -147,6 +218,7 @@ class Archive:
                    f"# {' '.join(title.split())[:120]}", ""]
             b.store(rel, "\n".join(fm))
             self._where[(provider, sid)] = rel
+            self.created.add(rel)
             created = True
         text = p.read_text(encoding="utf-8", errors="replace")
         seen = set(ANCHOR.findall(text))
@@ -180,6 +252,7 @@ class Archive:
                 b._index_one(p, p.stat())
                 b.db.commit()
             n = len(blocks)
+            self.appended[rel] = self.appended.get(rel, 0) + n
             b.log(agent, "archived", rel, f"{n} message{'s' if n != 1 else ''} from {display_name(provider)}")
             b.emit({"type": "changed", "actor": agent, "paths": [rel], "archive": True})
         return [res[i] for i in range(len(evs))]
@@ -211,3 +284,70 @@ def _block(ev: dict, revision: bool) -> str:
         meta = ", ".join(x for x in (a["mime"], f"{a['size']:,} bytes" if a["size"] is not None else "", f"sha256 {a['sha256'][:12]}" if a["sha256"] else "") if x)
         parts.append(f"- attachment: {a['name']}" + (f" ({meta})" if meta else "") + (f" <{a['uri']}>" if a["uri"] else ""))
     return "\n" + "\n".join(parts) + "\n"
+
+
+def forget(brain, provider: str | None = None, session: str | None = None, before: str | None = None,
+           agent: str = "you", dry_run: bool = False) -> dict:
+    """Delete archived conversations for good (no .trash copy, no history copy) and leave a tombstone
+    so capture on any device skips them from now on. Logged without content. Returns what was removed."""
+    if not (provider or session or before):
+        raise ValueError("say what to forget: a provider, a session, or a date (before)")
+    if before:
+        before = before.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?", before):
+            raise ValueError("before must be a date like 2026-01-31")
+    root = brain.root / "Conversations"
+    hits = []
+    for f in sorted(root.rglob("*.md")) if root.is_dir() else []:
+        try:
+            m = archive_meta(f.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if provider and m["provider"] != provider:
+            continue
+        if session and m["session"] != session:
+            continue
+        if before and not (m["started"] and m["started"][:19] <= before[:19]):
+            continue
+        hits.append((f, m))
+    removed = [f.relative_to(brain.root).as_posix() for f, _ in hits]
+    if dry_run:
+        return {"would_remove": removed, "count": len(removed)}
+    ts = Tombstones(brain)
+    if session:
+        for _, m in hits or [(None, {"provider": provider or "", "session": session})]:
+            ts.add({"provider": m["provider"] or provider, "session": session, "by": agent})
+    else:
+        ts.add({k: v for k, v in {"provider": provider, "before": before or _now_iso_local(), "by": agent}.items() if v})
+    for f, _ in hits:
+        rel = f.relative_to(brain.root).as_posix()
+        try:
+            f.unlink()
+        except OSError:
+            continue
+        hist = brain.history_dir / rel
+        if hist.is_dir():
+            shutil.rmtree(hist, ignore_errors=True)
+        with brain._lock:
+            brain._drop(rel)
+            brain.db.commit()
+    if removed:
+        brain.log(agent, "forgot", "Conversations/", f"{len(removed)} conversation(s)"
+                  + (f" from {provider}" if provider else "") + (f" before {before}" if before else ""))
+    return {"removed": removed, "count": len(removed)}
+
+
+def _now_iso_local() -> str:
+    from datetime import datetime
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def project_allowed(rules: dict, project: str) -> bool:
+    p = (project or "").lower()
+    exc = [str(x).lower() for x in rules.get("exclude", []) if x]
+    inc = [str(x).lower() for x in rules.get("include", []) if x]
+    if p and any(fnmatch.fnmatch(p, g) for g in exc):
+        return False
+    if p and inc and not any(fnmatch.fnmatch(p, g) for g in inc):
+        return False
+    return True

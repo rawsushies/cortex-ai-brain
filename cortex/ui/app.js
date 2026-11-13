@@ -533,7 +533,7 @@ async function viewChanges(actor = "") {
 /* ── settings: organizing rules ────────────────────── */
 async function viewSettings() {
   setTop("<b>Settings</b>", `<button class="btn primary" id="saveRules">Save</button>`);
-  const [rules, setup] = await Promise.all([get("/api/rules"), get("/api/setup")]);
+  const [rules, setup, capture, gw] = await Promise.all([get("/api/rules"), get("/api/setup"), get("/api/capture-rules"), get("/api/gateway")]);
   const st = rules.settings;
   const ruleRow = (r = { match: {} }) => `<tr>
     <td><input data-f="folder" value="${esc(r.match.folder || "")}" placeholder="Clients/"></td>
@@ -561,6 +561,20 @@ async function viewSettings() {
       <button class="btn" id="addRule" style="margin:8px 0 6px">Add rule</button>
     </div>
     <p class="why">Stored in <code>.cortex/rules.json</code> inside the brain folder, so every computer that shares the brain uses the same rules.</p>
+    <h3 class="panel-title">Capture <span>${gw.queue.delivered} archived · ${gw.queue.pending} waiting · ${gw.queue.dead} failed</span></h3>
+    <div class="list">${gw.adapters.filter((a) => a.provider !== "*").map((a) => {
+      const c = capture.providers[a.provider] || {};
+      return `<div class="set-row"><div><b>${esc({ "claude-code": "Claude Code", codex: "Codex", "gemini-cli": "Gemini CLI", cursor: "Cursor", chatgpt: "ChatGPT", "claude-ai": "Claude.ai", gemini: "Gemini (web)" }[a.provider] || a.provider)}</b>
+        <span class="pill ${a.tested === "live" ? "ok" : ""}">${a.tested === "live" ? "tested live" : "sample-tested"}</span>
+        <p>${esc(a.modes.join(", "))} · real time: ${esc(a.realtime)}</p>
+        <p>Keep for <input class="ret" data-p="${esc(a.provider)}" type="number" min="1" placeholder="forever" value="${c.retention_days || ""}" style="width:90px;padding:3px 6px"> days</p></div>
+        <label class="switch"><input type="checkbox" class="cap" data-p="${esc(a.provider)}" ${c.enabled === false ? "" : "checked"}><i></i></label></div>`;
+    }).join("")}
+      <div class="set-row"><div><b>Never capture these projects</b><p>One pattern per line, matched against the project folder, e.g. <code>*/client-*</code>.</p>
+        <textarea class="field" id="capExclude" rows="2" style="width:100%;margin-top:6px">${esc(capture.projects.exclude.join("\n"))}</textarea></div><span></span></div>
+      <div class="set-row"><div><b>Local apps and webhooks</b><p>${gw.rest_enabled ? "On: apps on this computer can send conversations to <code>POST /api/events</code> with the token." : "Off. Run <code>cortex gateway token</code> to let other apps on this computer send conversations."}</p></div><span></span></div>
+    </div>
+    <p class="why">Captured conversations are kept as they were said, with passwords and keys removed. Turning a provider off stops new capture; to delete what's stored, use <code>cortex gateway forget</code>.</p>
     <h3 class="panel-title">AI apps</h3>
     <div class="list"><div class="set-row"><div><b>Connect Claude Code, Codex, Gemini, Cursor and Claude Desktop</b><p>Cortex adds itself to each app's MCP settings and keeps a backup of each file.</p><div id="connectOut"></div></div>
       <button class="btn" id="doConnect">Connect</button></div></div>`;
@@ -582,6 +596,12 @@ async function viewSettings() {
     }).filter((r) => r.category || r.match.folder || r.match.keywords.length || r.match.regex);
     try {
       await post("/api/rules", { rules: list, settings: { auto_file: $("#autoFile").checked, stubs: $("#stubs").checked, stub_after: st.stub_after } });
+      const providers = {};
+      view.querySelectorAll(".cap").forEach((c) => {
+        const days = parseInt(view.querySelector(`.ret[data-p="${c.dataset.p}"]`).value, 10);
+        providers[c.dataset.p] = { enabled: c.checked, ...(days > 0 ? { retention_days: days } : {}) };
+      });
+      await post("/api/capture-rules", { providers, projects: { exclude: $("#capExclude").value.split("\n").map((x) => x.trim()).filter(Boolean), include: capture.projects.include }, redact: capture.redact });
       toast("Saved. New and changed notes use these rules");
       await post("/api/reindex", {});
       loadSidebar();

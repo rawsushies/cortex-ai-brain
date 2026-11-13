@@ -17,6 +17,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .core import Brain, ConflictError
 from .importers import Importer
+# Loaded once, up front: these modules import each other lazily, and two request threads importing
+# them at the same moment can deadlock Python's per-module import locks.
+from . import archive as _archive, organize as _organize, graph as _graph_mod  # noqa: F401,E402
+import cortex_gateway  # noqa: F401,E402
+from cortex_gateway import adapters as _gw_adapters, cli as _gw_cli, rules as _gw_rules, schema as _gw_schema  # noqa: F401,E402
 from .research import FetchError
 
 UI_DIR = Path(__file__).parent / "ui"
@@ -146,6 +151,8 @@ def make_handler(brain: Brain):
                                                       q.get("q") or None, _int(q.get("limit"), 100, lo=1, hi=500)),
                 "/api/topics": lambda: _topics(brain),
                 "/api/rules": lambda: _rules_get(brain),
+                "/api/capture-rules": lambda: _gwrules().load(brain.root),
+                "/api/gateway": lambda: _gateway_status(brain),
                 "/api/conversations": lambda: brain.recent(_int(q.get("limit"), 200), conversations="only") if not q.get("q")
                     else [h.__dict__ for h in brain.search(q["q"], _int(q.get("limit"), 50), scope="conversations")],
             }
@@ -159,9 +166,13 @@ def make_handler(brain: Brain):
 
         # ── POST / DELETE ────────────────────────────────────────────────
         def do_POST(self) -> None:
-            if not self._allowed() or not self._guard():
+            if not self._allowed():
                 return
             u = urlparse(self.path)
+            if u.path == "/api/events":  # local apps and webhooks: bearer token instead of the browser header
+                return self._route(self._events)
+            if not self._guard():
+                return
 
             def go():
                 b = self._body()
@@ -247,12 +258,45 @@ def make_handler(brain: Brain):
                     self._json(_topics(brain))
                 elif u.path == "/api/rules":
                     self._json(_rules_put(brain, b))
+                elif u.path == "/api/capture-rules":
+                    self._json(_gwrules().save(brain.root, b))
+                elif u.path == "/api/forget":
+                    from .archive import forget
+                    if not b.get("confirm") and not b.get("dry_run"):
+                        raise ValueError("forgetting deletes for good: send confirm=true (or dry_run=true to preview)")
+                    self._json(forget(brain, b.get("provider") or None, b.get("session") or None, b.get("before") or None,
+                                      agent="you", dry_run=bool(b.get("dry_run"))))
                 elif u.path == "/api/reindex":
                     self._json(brain.sync(force=True))
                 else:
                     self._json({"error": "not found"}, 404)
 
             self._route(go)
+
+        def _events(self) -> None:
+            import hmac
+            from .cli import load_config
+            want = load_config().get("gateway_token")
+            got = (self.headers.get("Authorization") or "")
+            if not want:
+                return self._json({"error": "REST intake is off: run `cortex gateway token` to turn it on"}, 403)
+            if not (got.startswith("Bearer ") and hmac.compare_digest(got[7:].strip().encode(), want.encode())):
+                return self._json({"error": "missing or wrong token"}, 401)
+            b = self._body()
+            events = b.get("events") if isinstance(b.get("events"), list) else [b] if b.get("provider") else None
+            if not events:
+                raise ValueError("send {events: [...]} or a single event object")
+            from cortex_gateway import Gateway
+            gw = Gateway(brain, agent="rest")
+            try:
+                for e in events:
+                    if isinstance(e, dict):
+                        e.setdefault("capture", "rest")
+                res = gw.ingest_now(events)
+            finally:
+                gw.close()
+            self._json({"results": res, **{k: sum(1 for r in res if r["status"] == k)
+                                           for k in ("archived", "duplicate", "invalid", "skipped", "queued")}})
 
         def do_DELETE(self) -> None:
             if not self._allowed() or not self._guard():
@@ -276,6 +320,22 @@ def _int(v, default: int, lo: int = 0, hi: int = 100_000) -> int:
     except (TypeError, ValueError, OverflowError):
         n = default
     return max(lo, min(n, hi))
+
+
+def _gwrules():
+    from cortex_gateway import rules
+    return rules
+
+
+def _gateway_status(brain: Brain) -> dict:
+    from cortex_gateway import Gateway
+    from cortex_gateway.adapters import capabilities
+    from .cli import load_config
+    gw = Gateway(brain)
+    try:
+        return {"queue": gw.queue.status(), "adapters": capabilities(), "rest_enabled": bool(load_config().get("gateway_token"))}
+    finally:
+        gw.close()
 
 
 def _graph():
@@ -353,6 +413,13 @@ def _auto_backup(brain: Brain, stop: threading.Event) -> None:
     """One verified snapshot a day (if a backup folder is set), checked hourly."""
     stop.wait(60)  # let the app settle first
     while not stop.is_set():
+        try:
+            from cortex_gateway.cli import retain  # conversations past their provider's retention: forgotten daily
+            r = retain(brain)
+            if any(r["forgot"].values()):
+                print(f"Retention: forgot {sum(r['forgot'].values())} old conversation(s)")
+        except Exception as e:
+            print(f"Retention skipped: {e}")
         try:
             cfg = _cfg()
             if _cloud().backup_due(cfg):

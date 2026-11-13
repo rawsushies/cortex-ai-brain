@@ -405,10 +405,15 @@ def main(argv=None) -> None:
         if name == "connect":
             s.add_argument("--all", action="store_true", help="also write configs for apps not detected")
     g = sub.add_parser("gateway", help="capture conversations from AI providers (scan, hook, drop, status, retry)")
-    g.add_argument("action", choices=["scan", "hook", "drop", "status", "retry", "capabilities"])
+    g.add_argument("action", choices=["scan", "hook", "drop", "status", "retry", "capabilities", "import", "forget",
+                                      "retain", "token"])
     g.add_argument("provider", nargs="?", help="e.g. claude-code")
     g.add_argument("--provider", dest="provider_opt")
     g.add_argument("--dead", action="store_true", help="with retry: also retry dead letters")
+    g.add_argument("--session", help="with forget: one conversation (its session id)")
+    g.add_argument("--before", help="with forget: everything started before this date (YYYY-MM-DD)")
+    g.add_argument("--dry-run", action="store_true", help="with forget: show what would be deleted")
+    g.add_argument("--new", action="store_true", help="with token: make a new token (the old one stops working)")
     g.add_argument("--vault")
     cv = sub.add_parser("config", help="show or set settings (e.g. `cortex config vault`)")
     cv.add_argument("key", choices=["vault"])
@@ -439,6 +444,10 @@ def main(argv=None) -> None:
     if cmd == "app" and not (getattr(args, "vault", None) or os.environ.get("CORTEX_VAULT") or load_config().get("vault")):
         # First launch (e.g. double-clicking Cortex.exe): create the brain in Documents\Cortex.
         cmd_init(argparse.Namespace(vault=None))
+    if cmd == "gateway" and args.action in ("capabilities", "token"):  # need no vault
+        from cortex_gateway.cli import run as gw_run
+        print(json.dumps(gw_run(None, args.action, new=args.new), indent=2))
+        return
     vault = vault_path(getattr(args, "vault", None))
     if cmd not in ("mcp", "gateway"):
         upgrade_rules(vault)
@@ -448,7 +457,9 @@ def main(argv=None) -> None:
     if cmd == "gateway":
         from cortex_gateway.cli import run as gw_run
         try:
-            r = gw_run(vault, args.action, args.provider_opt or args.provider, args.dead)
+            prov = args.provider_opt or args.provider
+            r = gw_run(vault, args.action, None if args.action == "import" else prov, args.dead, session=args.session,
+                       before=args.before, dry_run=args.dry_run, file=prov if args.action == "import" else None, new=args.new)
         except Exception as e:
             if args.action != "hook":
                 raise

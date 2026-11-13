@@ -511,55 +511,51 @@ class Importer:
                     state[fkey] = sig
 
     def run(self, sources: set[str] | None = None, export: Path | None = None) -> dict:
+        """Import through the memory gateway (cortex_gateway): canonical events, an append-only archive,
+        dedup by message on every device, capture rules and tombstones respected. Same results shape
+        as before: new / updated conversations, per source."""
         if not self._acquire():
             return {"skipped": "another import is running"}
+        from cortex_gateway import Gateway
+        from cortex_gateway.adapters import claude_code, exports, local_apps
+        gw = Gateway(self.brain, agent="cortex")
         try:
             state = self._load()
             notes = state.setdefault("notes", {})
+            if export:
+                gw.submit(exports.events_from_file(export))
+            else:
+                if sources is None or "claude-code" in sources:  # one capture path per provider: by message uuid
+                    claude_code.scan(gw, capture="local-file", paths=claude_code_files())
+                rest = None if sources is None else (sources - {"claude-code"})
+                if rest is None or rest:
+                    for c in self._local_conversations(state, (rest if rest is not None else {"codex", "gemini", "cursor"})):
+                        prev = notes.get(c.key)
+                        if prev and prev.get("sig") == c.sig:
+                            continue
+                        try:
+                            gw.submit(local_apps.events_for(c))
+                        except Exception as e:  # one odd conversation must not stop the import
+                            print(f"cortex import: skipped {c.source} {c.key}: {e}", file=sys.stderr)
+                            continue
+                        notes[c.key] = {"sig": c.sig}
+            delivered = gw.run()
+            created = set(gw.archive.created)
+            touched = set(gw.archive.appended)
+            new, updated = len(created), len(touched - created)
             counts: dict[str, int] = {}
-            convs = parse_export(export) if export else self._local_conversations(state, sources)
-            new = updated = 0
-            for c in convs:
-                prev = notes.get(c.key)
-                if prev and prev.get("sig") == c.sig and (self.brain.root / prev["path"]).exists():
-                    continue
-                rel = prev["path"] if prev else note_path(c)
-                existing = self.brain.root / rel
-                try:  # the gateway owns this conversation now (append-only, anchored): never overwrite it
-                    if existing.exists() and "<!-- m:" in existing.read_text(encoding="utf-8", errors="replace"):
-                        notes[c.key] = {"sig": c.sig, "path": rel}
-                        continue
-                except OSError:
-                    pass
-                try:
-                    self.brain.store(rel, render(c))
-                except (ValueError, OSError) as e:  # one odd conversation must not stop the import
-                    print(f"cortex import: skipped {c.source} {c.key}: {e}", file=sys.stderr)
-                    continue
-                notes[c.key] = {"sig": c.sig, "path": rel}
-                counts[c.source] = counts.get(c.source, 0) + 1
-                if prev:
-                    updated += 1
-                else:
-                    new += 1
-                if (new + updated) % 200 == 0:
-                    self._save(state)  # progress survives an interruption
+            for rel in touched:
+                src = rel.split("/")[1] if rel.count("/") >= 2 else "?"
+                counts[src] = counts.get(src, 0) + 1
             state["last_run"] = _iso(time.time())
             self._save(state)
             if new or updated:
                 self.brain.log("cortex", "imported", "Conversations/",
-                               f"{new} new, {updated} updated conversation(s): "
-                               + ", ".join(f"{k} {v}" for k, v in counts.items()))
-            topics = None
-            if new or updated:
-                try:  # group the new chats into Topics/ while we're here (incremental, bounded)
-                    from .organize import Organizer
-                    topics = Organizer(self.brain).group_conversations(agent="cortex")
-                except Exception as e:
-                    print(f"cortex import: topic grouping skipped: {e}", file=sys.stderr)
+                               f"{new} new, {updated} updated conversation(s): " + ", ".join(f"{k} {v}" for k, v in counts.items()))
             return {"new": new, "updated": updated, "by_source": counts, "last_run": state["last_run"],
-                    "topics": topics}
+                    "delivery": delivered}
         finally:
+            gw.close()
             try:
                 self.lock_file.unlink()
             except OSError:
@@ -567,10 +563,15 @@ class Importer:
 
     def status(self) -> dict:
         state = self._load()
+        from cortex_gateway.schema import DISPLAY
+        names = {"claude-code": "claude-code", "codex": "codex", "gemini-cli": "gemini", "cursor": "cursor",
+                 "chatgpt": "chatgpt", "claude-ai": "claude-ai", "gemini": "gemini-web", "core": "core"}
         by_source: dict[str, int] = {}
-        for k in state.get("notes", {}):
-            src = k.split(":", 1)[0]
-            by_source[src] = by_source.get(src, 0) + 1
+        for prov, key in names.items():
+            n = self.brain.db.execute("SELECT count(*) FROM notes WHERE path LIKE ?",
+                                      (f"Conversations/{DISPLAY[prov]}/%",)).fetchone()[0]
+            if n:
+                by_source[key] = n
         detected = {"claude-code": bool(claude_code_files()), "codex": bool(codex_files()),
                     "gemini": bool(gemini_files()), "cursor": bool(cursor_db())}
         return {"last_run": state.get("last_run"), "conversations": by_source, "detected": detected}

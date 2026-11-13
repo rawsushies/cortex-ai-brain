@@ -28,6 +28,9 @@ from datetime import date
 from . import __version__
 from .core import ACTOR, Brain, ConflictError, section_text
 from .research import FetchError
+from . import archive as _archive  # noqa: F401,E402  (eager: avoids import-lock deadlocks between threads)
+import cortex_gateway  # noqa: F401,E402
+from cortex_gateway import schema as _gw_schema  # noqa: F401,E402
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 GUIDE_FILES = ("_CORTEX.md", "AGENTS.md", "CLAUDE.md")

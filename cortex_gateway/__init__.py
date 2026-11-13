@@ -29,18 +29,41 @@ class Gateway:
         self.queue.close()
 
     def submit(self, raw_events: list) -> dict:
-        """Normalize and validate; queue the valid ones (idempotent), keep the invalid ones with reasons."""
-        good, invalid = [], []
+        """Normalize and validate; apply capture rules and tombstones; queue the valid ones (idempotent),
+        keep the invalid ones with reasons. Skipped events are not stored anywhere."""
+        import re
+        from cortex.archive import project_allowed
+        from . import rules as R
+        rules = R.load(self.brain.root)
+        extra = [re.compile(p) for p in rules["redact"]]
+        good, invalid, skipped = [], [], []
         for i, raw in enumerate(raw_events if isinstance(raw_events, list) else []):
             ev = normalize(raw)
             errs = validate(ev)
             if errs:
                 invalid.append({"index": i, "reasons": errs})
                 self.queue.reject(raw, errs)
-            else:
-                good.append(ev)
+                continue
+            why = None
+            if not rules["providers"].get(ev["provider"], {}).get("enabled", True):
+                why = f"capture from {ev['provider']} is turned off"
+            elif not project_allowed(rules["projects"], ev["session"]["project"]):
+                why = "this project is excluded from capture"
+            elif self.archive.tombstones.blocks(ev["provider"], ev["session"]["id"], ev["session"]["started"] or ev["message"]["ts"]):
+                why = "forgotten"
+            if why:
+                skipped.append({"index": i, "reason": why, "event_id": ev["event_id"]})
+                continue
+            if extra and ev["message"]["text"]:
+                text = ev["message"]["text"]
+                for rx in extra:
+                    text = rx.sub("[REDACTED]", text)
+                if text != ev["message"]["text"]:
+                    ev["message"]["text"] = text
+                    ev["privacy"]["redacted"] = True
+            good.append(ev)
         new = self.queue.enqueue(good) if good else 0
-        return {"accepted": len(good), "new": new, "invalid": invalid, "events": good}
+        return {"accepted": len(good), "new": new, "invalid": invalid, "skipped": skipped, "events": good}
 
     def deliver(self, events: list[dict]) -> list[dict]:
         return self.archive.append(events, agent=self.agent)
@@ -73,9 +96,13 @@ class Gateway:
         self.queue.drain(self.deliver)
         out, good, seen = [], iter(sub["events"]), set()
         bad = {x["index"]: x["reasons"] for x in sub["invalid"]}
+        skip = {x["index"]: x for x in sub["skipped"]}
         for i in range(len(raw_events)):
             if i in bad:
                 out.append({"index": i, "status": "invalid", "reasons": bad[i]})
+                continue
+            if i in skip:
+                out.append({"index": i, "event_id": skip[i]["event_id"], "status": "skipped", "reason": skip[i]["reason"]})
                 continue
             ev = next(good)
             if ev["event_id"] in seen:  # the same event twice in one call

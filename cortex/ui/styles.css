@@ -146,7 +146,7 @@ h1, h2, h3, .hello { font-weight: 640; font-variation-settings: "opsz" 32; lette
 .btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 .btn.ghost-accent { color: var(--accent); border-color: var(--edge); border-radius: var(--r-pill); }
 .btn:disabled { opacity: .55; cursor: default; }
-input[type="text"], input:not([type]), input[type="date"], input[type="search"], select, textarea.field, .path-in {
+input[type="text"], input:not([type]), input[type="date"], input[type="number"], input[type="search"], select, textarea.field, .path-in {
   background: var(--void); border: 1px solid var(--line); border-radius: var(--r-ctl); padding: 7px 10px; outline: 0; }
 input:focus, select:focus, textarea:focus { border-color: var(--edge); }
 input::placeholder, textarea::placeholder { color: var(--faint); }

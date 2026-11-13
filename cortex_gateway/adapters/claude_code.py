@@ -83,21 +83,21 @@ def read_new(path: Path, offset: int) -> tuple[list[dict], int]:
             continue
         if not isinstance(o, dict):
             continue
-        sid = str(o.get("sessionId") or path.stem)
+        sid = path.stem  # Claude Code names each transcript after its session id
         if o.get("type") == "summary" and o.get("summary"):
             title = str(o["summary"])
             events.append({"provider": PROVIDER, "adapter": ADAPTER, "kind": "session",
                            "session": {"id": sid, "title": title},
                            "message": {"id": "session"}, "provenance": {"source_uri": str(path), "source_offset": line_at}})
             continue
-        if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta") or not o.get("uuid"):
+        if o.get("type") not in ("user", "assistant") or o.get("isSidechain") or o.get("isMeta"):
             continue
         text = _text(o)
         if not text:
             continue  # tool results and empty turns
         events.append({"provider": PROVIDER, "adapter": ADAPTER, "kind": "message",
                        "session": {"id": sid, "title": title, "project": o.get("cwd") or "", "started": o.get("timestamp")},
-                       "message": {"id": str(o["uuid"]), "role": o["type"], "text": text, "ts": o.get("timestamp"),
+                       "message": {"id": str(o.get("uuid") or f"line:{line_at}"), "role": o["type"], "text": text, "ts": o.get("timestamp"),
                                    "model": (o.get("message") or {}).get("model") or ""},
                        "provenance": {"source_uri": str(path), "source_offset": line_at}})
     return events, offset + end
