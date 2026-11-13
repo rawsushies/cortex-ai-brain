@@ -227,6 +227,10 @@ def view(brain, focus: str | None = None, depth: int = 1, metric: str = "pageran
     else:
         chosen = sorted((k for k in nodes if not nodes[k].get("missing")), key=lambda k: -nodes[k].get(metric, 0))[:limit]
     ids = set(chosen)
+    if not focus:  # unresolved link targets touching what's shown (drawn as red dots, like Obsidian)
+        extra = [b for a, b in data["edges"] if a in ids and b.startswith("?")]
+        chosen += sorted(set(extra))[:300]
+        ids = set(chosen)
     return {"metric": metric, "focus": focus, "nodes": [nodes[k] for k in chosen],
             "edges": [{"source": a, "target": b} for a, b in data["edges"] if a in ids and b in ids],
             "clusters": data["clusters"][:12], "stats": data["stats"], "exact": data["exact"],

@@ -26,7 +26,7 @@ MAX_BODY = 25_000_000
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".woff2": "font/woff2"}
 
 
 def make_handler(brain: Brain):
@@ -135,6 +135,17 @@ def make_handler(brain: Brain):
                 "/api/setup": lambda: {"import_history": _cfg().get("import_history"),
                                        "connected": bool(_cfg().get("connected_at")),
                                        "detected": Importer(brain).status()["detected"]},
+                "/api/graph2": lambda: _graph().view(brain, q.get("focus") or None, _int(q.get("depth"), 1, lo=1, hi=3),
+                                                     q.get("metric") or "pagerank", _int(q.get("limit"), 1500, lo=1, hi=5000),
+                                                     conversations=q.get("conversations") == "1"),
+                "/api/categories": lambda: brain.categories(),
+                "/api/notes_meta": lambda: [dict(r) for r in brain.db.execute(
+                    "SELECT path, title, category, tags, mtime FROM notes ORDER BY lower(path)")],
+                "/api/changes": lambda: brain.changesets(_int(q.get("limit"), 100, lo=1, hi=1000), q.get("actor") or None),
+                "/api/records": lambda: brain.records(q.get("type") or None, q.get("category") or None, q.get("source") or None,
+                                                      q.get("q") or None, _int(q.get("limit"), 100, lo=1, hi=500)),
+                "/api/topics": lambda: _topics(brain),
+                "/api/rules": lambda: _rules_get(brain),
                 "/api/conversations": lambda: brain.recent(_int(q.get("limit"), 200), conversations="only") if not q.get("q")
                     else [h.__dict__ for h in brain.search(q["q"], _int(q.get("limit"), 50), scope="conversations")],
             }
@@ -222,6 +233,20 @@ def make_handler(brain: Brain):
                                                R.results_markdown(b["query"], b["data"]), agent="you"))
                 elif u.path == "/api/capture":
                     self._json(brain.capture(b["text"], agent="you"))
+                elif u.path == "/api/ingest":
+                    from .organize import Organizer
+                    if not isinstance(b.get("text"), str):
+                        raise ValueError("text must be a string")
+                    self._json(Organizer(brain).ingest(b["text"], agent="you", kind=b.get("type") or None,
+                                                       title=b.get("title") or None, project=b.get("project") or None))
+                elif u.path == "/api/undo":
+                    self._json(brain.undo(b.get("changeset") or None, agent="you"))
+                elif u.path == "/api/topics/refresh":
+                    from .organize import Organizer
+                    Organizer(brain).group_conversations(agent="cortex")
+                    self._json(_topics(brain))
+                elif u.path == "/api/rules":
+                    self._json(_rules_put(brain, b))
                 elif u.path == "/api/reindex":
                     self._json(brain.sync(force=True))
                 else:
@@ -251,6 +276,67 @@ def _int(v, default: int, lo: int = 0, hi: int = 100_000) -> int:
     except (TypeError, ValueError, OverflowError):
         n = default
     return max(lo, min(n, hi))
+
+
+def _graph():
+    from . import graph
+    return graph
+
+
+def _topics(brain: Brain) -> list[dict]:
+    from .importers import _safe
+    from .organize import Organizer
+    data = Organizer(brain).load_topics()
+    rows = [{"id": tid, "name": t["name"], "terms": list(t["terms"])[:8], "conversations": len(t["members"]),
+             "note": f"Topics/{_safe(t['name'], 60)}.md", "latest": max(t["members"]) if t["members"] else ""}
+            for tid, t in data["topics"].items() if t["members"]]
+    return sorted(rows, key=lambda r: (-r["conversations"], r["name"]))
+
+
+def _rules_get(brain: Brain) -> dict:
+    f = brain.meta_dir / "rules.json"
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {"rules": data if isinstance(data, list) else []}
+    data.setdefault("rules", [])
+    data.setdefault("settings", {"auto_file": False, "stubs": True, "stub_after": 3})
+    return data
+
+
+def _rules_put(brain: Brain, body: dict) -> dict:
+    """Validate and save .cortex/rules.json (written atomically; synced with the vault)."""
+    rules = body.get("rules", [])
+    settings = body.get("settings", {})
+    if not isinstance(rules, list) or not isinstance(settings, dict) or len(rules) > 500:
+        raise ValueError("rules must be a list (at most 500) and settings an object")
+    import re as _re
+    clean = []
+    for r in rules:
+        if not isinstance(r, dict) or not isinstance(r.get("match"), dict) or not str(r.get("category") or "").strip():
+            raise ValueError("each rule needs a match {folder, keywords, regex} and a category")
+        m = r["match"]
+        if m.get("regex"):
+            try:
+                _re.compile(str(m["regex"])[:300])
+            except _re.error as e:
+                raise ValueError(f"bad regex in rule for {r['category']}: {e}")
+        kws = m.get("keywords") or []
+        clean.append({"match": {k: v for k, v in {"folder": str(m.get("folder") or "")[:120],
+                                                    "keywords": [str(k)[:60] for k in (kws if isinstance(kws, list) else [kws])][:30],
+                                                    "regex": str(m.get("regex") or "")[:300]}.items() if v},
+                      "category": str(r["category"]).strip()[:40],
+                      **({"folder": str(r["folder"])[:120]} if r.get("folder") else {}),
+                      **({"tags": [str(t)[:40] for t in r["tags"]][:10]} if isinstance(r.get("tags"), list) else {})})
+    out = {"rules": clean, "settings": {"auto_file": bool(settings.get("auto_file")), "stubs": settings.get("stubs") is not False,
+                                        "stub_after": max(2, min(int(settings.get("stub_after") or 3), 20))}}
+    f = brain.meta_dir / "rules.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, f)
+    return out
 
 
 def _cfg() -> dict:

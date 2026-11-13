@@ -103,18 +103,19 @@ def find_tasks(text: str, today: date | None = None) -> list[dict]:
             in_code = not in_code
         if in_code or not raw.strip() or raw.lstrip().startswith(("#", ">", "|")) or re.match(r"^\s*[-*+]\s+\[[ xX]\]", raw):
             continue
-        for sentence in re.split(r"(?<=[.!?])\s+", _plain(raw)):
+        for sentence in re.split(r"(?<=[.!?;])\s+", _plain(raw)):
             s = sentence.strip()
             if len(s) < 4 or s.endswith("?"):
                 continue
             m = TRIGGERS.match(s)
-            due, phrase = find_date(s, today)
             if m:
                 body = s[m.end():]
-            elif due and (WORD.findall(s) or [""])[0].lower() in VERBS:
-                body = s  # imperative with a date: "pay rent by Friday"
+                due, phrase = find_date(body, today)  # the date that belongs to the action, not one said earlier
             else:
-                continue
+                due, phrase = find_date(s, today)
+                if not (due and (WORD.findall(s) or [""])[0].lower() in VERBS):
+                    continue
+                body = s  # imperative with a date: "pay rent by Friday"
             body = strip_date(body, phrase).rstrip(" .!;,")
             body = re.sub(r"^(?:to|untuk|nak)\s+", "", body, flags=re.I)
             if len(WORD.findall(body)) < 1 or len(body) < 3:
